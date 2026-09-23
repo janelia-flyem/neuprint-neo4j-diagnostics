@@ -26,8 +26,19 @@ post() {
 import json,sys
 print(json.dumps({"dataset": sys.argv[1], "cypher": open(sys.argv[2]).read()}))
 PY
-  curl -sS -m 300 -X POST "$S/api/custom/custom" -H 'Content-Type: application/json' \
-       ${AUTH[@]+"${AUTH[@]}"} -d @"$W/p.json"
+  HTTP=$(curl -sS -m 300 -o "$W/resp.json" -w '%{http_code}' -X POST "$S/api/custom/custom" \
+       -H 'Content-Type: application/json' ${AUTH[@]+"${AUTH[@]}"} -d @"$W/p.json")
+  if [ "$HTTP" != "200" ]; then
+      # A 401 arrives as {"message":"authentication required"} with no
+      # "error" key, so without this it reads as an empty result set and
+      # is reported as "nothing lost" -- a false all-clear.
+      python3 -c "
+import json,sys
+print(json.dumps({'error': 'HTTP ' + sys.argv[2] + ': ' + open(sys.argv[1]).read()[:160]}))" \
+          "$W/resp.json" "$HTTP"
+  else
+      cat "$W/resp.json"
+  fi
 }
 for f in fast slow; do
   [ -r "$Q/$f.cypher" ] || { echo "ERROR: $Q/$f.cypher missing -- run extract-queries.sh first" 1>&2; exit 2; }
@@ -37,7 +48,7 @@ printf "%-10s %10s %10s %10s %s\n" TERM FAST SLOW LOST "% MISSING"
 IFS=',' read -ra TL <<< "$TERMS"
 for t in "${TL[@]}"; do
   for f in fast slow; do
-    sed -e "s/TERM/$t/" -e "s/BODY/0/" "$Q/$f.cypher" > "$W/$f.cypher"
+    sed -e "s/TERM/$t/g" -e "s/BODY/0/g" "$Q/$f.cypher" > "$W/$f.cypher"
     post "$W/$f.cypher" > "$W/$f.json"
   done
   python3 - "$t" "$W/fast.json" "$W/slow.json" <<'PY'

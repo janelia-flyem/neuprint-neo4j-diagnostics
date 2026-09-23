@@ -55,8 +55,19 @@ post() {  # $1=dataset $2=cypher-file
 import json, sys
 print(json.dumps({"dataset": sys.argv[1], "cypher": open(sys.argv[2]).read()}))
 PY
-    curl -sS -m 300 -X POST "$S/api/custom/custom" -H 'Content-Type: application/json' \
-         ${AUTH[@]+"${AUTH[@]}"} -d @"$W/p.json"
+    HTTP=$(curl -sS -m 300 -o "$W/resp.json" -w '%{http_code}' -X POST "$S/api/custom/custom" \
+         -H 'Content-Type: application/json' ${AUTH[@]+"${AUTH[@]}"} -d @"$W/p.json")
+    if [ "$HTTP" != "200" ]; then
+        # A 401 arrives as {"message":"authentication required"} with no
+        # "error" key, so without this it reads as an empty result set and
+        # is reported as "nothing lost" -- a false all-clear.
+        python3 -c "
+import json,sys
+print(json.dumps({'error': 'HTTP ' + sys.argv[2] + ': ' + open(sys.argv[1]).read()[:160]}))" \
+            "$W/resp.json" "$HTTP"
+    else
+        cat "$W/resp.json"
+    fi
 }
 
 DS_LIST=$(curl -sS -m 60 "$S/api/dbmeta/datasets" ${AUTH[@]+"${AUTH[@]}"} | python3 -c "
@@ -109,8 +120,8 @@ except Exception:
     print('slow')
 PY
 )
-    sed -e "s/TERM/$TERM/" -e "s/BODY/0/" "$Q/$DEC.cypher" > "$W/served.cypher"
-    sed -e "s/TERM/$TERM/" -e "s/BODY/0/" "$Q/slow.cypher" > "$W/truth.cypher"
+    sed -e "s/TERM/$TERM/g" -e "s/BODY/0/g" "$Q/$DEC.cypher" > "$W/served.cypher"
+    sed -e "s/TERM/$TERM/g" -e "s/BODY/0/g" "$Q/slow.cypher" > "$W/truth.cypher"
     post "$DS" "$W/served.cypher" > "$W/s.json"
     post "$DS" "$W/truth.cypher"  > "$W/t.json"
     python3 - "$DS" "$DEC" "$W/s.json" "$W/t.json" <<'PY'
