@@ -113,10 +113,30 @@ branch, unmerged as of this writing — see [PR #71][pr].
 [d]: https://github.com/janelia-flyem/flyem-snapshot/blob/neo4j-5-upgrade/inert-index-demo.md
 [q]: https://github.com/janelia-flyem/flyem-snapshot/blob/neo4j-5-upgrade/neuprint-search-query-fixes.md
 
+## `findneurons/` — search-quality diagnostics
+
+A second set, for neuPrintExplorer's neuron autocomplete rather than for
+index health. The autocomplete picks between a fulltext-index query and a
+label scan per dataset, and the two only agree if the index covers all
+eleven properties the search ranks on. When it does not, results go missing
+silently.
+
+These measure that: index coverage per dataset, rows a user actually receives
+versus the complete set, and the remediation DDL. See
+[`findneurons/README.md`](findneurons/README.md).
+
+One warning from that directory is worth repeating here, because it applies
+to every script in this repo: **`/api/dbmeta/datasets` returns fewer datasets
+to an anonymous client than to a token holder.** On `neuprint.janelia.org`
+that is nine versus ten, and the hidden one was the worst case we found. An
+unauthenticated audit can produce a confident all-clear that means nothing.
+
 ## Requirements
 
 `bash`, `python3` (stdlib only), and `curl` for the HTTP scripts. The Bolt
-audit needs `cypher-shell`; the demo needs `podman` or `docker`. The HTTP
-scripts need `NEUPRINT_TOKEN` and exit with a warning if it is unset.
+audit needs `cypher-shell`; the demo needs `podman` or `docker`; the
+`findneurons` extractor needs `node` and a neuPrintExplorer checkout. The
+HTTP scripts read `NEUPRINT_JWT` or `NEUPRINT_TOKEN` from the environment and
+use it only in a request header, never printing or storing it.
 
 Tested on macOS `bash` 3.2 and on Linux, so no bash-4 syntax.
