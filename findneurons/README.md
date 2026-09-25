@@ -142,9 +142,17 @@ neuPrintExplorer **v1.72.3**, and both validated against
   short. What the index covers is what is searchable.
 
 Separately, **rebuilding an index fixes the loss outright**. `yakuba-vnc` was
-rebuilt through the normal pipeline on 2026-09-24 and went from 3/11 coverage
-to 11/11; its worst term went from 318 of 21,183 rows to 21,182 of 21,182.
-That is the remedy these tools exist to point at.
+rebuilt on 2026-09-24 and went from 3/11 coverage to 11/11; its worst term
+went from 318 of 21,183 rows to 21,182 of 21,182. That is the remedy these
+tools exist to point at.
+
+Note how that was achieved, because it is not yet automatic: the eleven
+properties were listed explicitly under
+`find-neurons-fulltext-index-properties` in `yakuba/yakuba-master-snapshot.yaml`
+in the `snapshot-configs` repository. `flyem-snapshot`'s **default is still
+three** on master, so a dataset whose config does not set the list keeps
+getting a three-property index however often it is rebuilt. Each dataset needs
+that config edit until `644158a` reaches master.
 
 ## Findings, 2026-09-23
 
@@ -179,7 +187,11 @@ Three things worth knowing when reading numbers like these:
 
 ## Related
 
-The client-side fix is `fix(FindNeurons): require full index coverage` in
-neuPrintExplorer, with the reasoning in that repo's
-`FINDNEURONS_FAST_PATH.md`. The server-side fix is `flyem-snapshot`'s
-`644158a`.
+The client-side fixes are in neuPrintExplorer, with the reasoning in that
+repo's `FINDNEURONS_FAST_PATH.md`. Note an index-coverage check was added
+there and then removed again (#385, reverted by #387) -- the index is the
+contract.
+
+The server-side fix is `flyem-snapshot`'s `644158a`, still on its
+`neo4j-5-upgrade` branch. Until it lands on master, a dataset gets all eleven
+properties only if its own config in `snapshot-configs` lists them.
