@@ -44,11 +44,28 @@ for f in fast slow; do
   [ -r "$Q/$f.cypher" ] || { echo "ERROR: $Q/$f.cypher missing -- run extract-queries.sh first" 1>&2; exit 2; }
 done
 echo "$DS on $S   (fast query vs slow query, from $Q)"
+
+# Fill a query template. LUCENE is only present for clients from v1.72.3
+# onward, which build the fulltext string in JavaScript; earlier ones build it
+# inline in Cypher and the substitution is a no-op.
+fill_query() {   # $1=template $2=term $3=bodyId $4=output
+    local lucene=""
+    if grep -q 'LUCENE' "$1"; then
+        if [ -x "$Q/lucene.py" ]; then
+            lucene=$("$Q/lucene.py" "$2")
+        else
+            echo "ERROR: $1 needs LUCENE but $Q/lucene.py is missing -- re-run extract-queries.sh" 1>&2
+            return 1
+        fi
+    fi
+    sed -e "s/TERM/$2/g" -e "s/BODY/$3/g" -e "s/LUCENE/${lucene}/g" "$1" > "$4"
+}
+
 printf "%-10s %10s %10s %10s %s\n" TERM FAST SLOW LOST "% MISSING"
 IFS=',' read -ra TL <<< "$TERMS"
 for t in "${TL[@]}"; do
   for f in fast slow; do
-    sed -e "s/TERM/$t/g" -e "s/BODY/0/g" "$Q/$f.cypher" > "$W/$f.cypher"
+    fill_query "$Q/$f.cypher" "$t" 0 "$W/$f.cypher" || continue
     post "$W/$f.cypher" > "$W/$f.json"
   done
   python3 - "$t" "$W/fast.json" "$W/slow.json" <<'PY'

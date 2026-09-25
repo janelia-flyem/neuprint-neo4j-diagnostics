@@ -49,8 +49,20 @@ line. All output here is safe to paste into a ticket.
 ### `extract-queries.sh <repo> [git-ref] [outdir]`
 
 Writes `fast.cypher`, `slow.cypher`, `version.cypher` and `index.cypher` from
-`NeuronInputField.jsx` at a given git ref. The search queries keep `TERM` and
-`BODY` placeholders for callers to substitute.
+`NeuronInputField.jsx` at a given git ref, plus a copy of `lucene.py`. The
+search queries keep placeholders for callers to substitute:
+
+| placeholder | meaning |
+|---|---|
+| `TERM` | the raw search term, for the Cypher literals |
+| `BODY` | the bodyId |
+| `LUCENE` | the fulltext query string |
+
+`LUCENE` appears only for clients from **v1.72.3** onward, which build that
+string in JavaScript (`buildLuceneQuery`) instead of `'*' + q + '*'` in
+Cypher. `lucene.py` mirrors that rule so the consuming scripts share one
+implementation; earlier revisions have no such placeholder and the
+substitution is a no-op.
 
 Everything else reads these files, so what gets tested is what the component
 actually sends rather than a transcription. The git ref matters because the
@@ -72,25 +84,25 @@ The `LOST` column is what a user fails to see.
 It infers the decision logic from the extracted `index.cypher`, so it follows
 whichever client you extracted:
 
-| `index.cypher` contains | decision style |
-|---|---|
-| `db.indexes()` | name existence only (pre-#383) |
-| `state, properties` | state and full coverage (the fix) |
-| otherwise | state only (#383 as merged) |
+| `index.cypher` contains | decision style | seen in |
+|---|---|---|
+| `db.indexes()` | name existence only | before #383 |
+| `state, properties` | state and full coverage | #385 only, removed by #387 |
+| otherwise | state only | #383, and current |
 
 Which makes it straightforward to compare two client versions against the
-same server. Extracting `origin/master` and the fix branch in turn, then
-running both against `neuprint-test`:
+same server. Extracting two refs in turn and running both against
+`neuprint-test` showed what the short-lived coverage check did:
 
 ```
-# origin/master        -> capability check: state-only
-flywire-fafb:v783b  fast   4391 served   4397 complete   6 lost
-# the coverage fix     -> capability check: coverage
-flywire-fafb:v783b  slow   4397 served   4397 complete   0 lost
+# state-only        flywire-fafb:v783b  fast   4391 served  4397 complete  6 lost
+# with coverage     flywire-fafb:v783b  slow   4397 served  4397 complete  0 lost
 ```
 
-Same server, same term, different client: the fix moves that dataset off the
-fast path and the loss goes to zero.
+The coverage check was removed in #387 -- the index is the contract, and an
+index covering too little is fixed by rebuilding it rather than by the client
+falling back to a label scan. The comparison remains useful for any pair of
+refs; this one is kept because it is what the decision was made on.
 
 ### `term-loss.sh <server> <dataset> [terms] [queries-dir]`
 
@@ -113,6 +125,26 @@ Finds a browser-observable case: a neuron whose `class` value appears in no
 `type`, `instance` or `synonyms`, so only a class search can find it. Type
 that value into the web UI and it should be offered; on an incomplete index
 it is not.
+
+## Fixes that landed
+
+Two client changes came out of this work, both merged and released in
+neuPrintExplorer **v1.72.3**, and both validated against
+`neuprint-test.janelia.org` afterwards:
+
+- **Punctuation in search terms** (#386). `R1-R6` returned 0 of 3,377
+  matching neurons, because the analyzer splits on punctuation and no token
+  equals `r1-r6`. Now `*r1* AND *r6*`. Re-measured after deployment:
+  `R1-R6`, `KCab-s`, `SNta02,SNta09` and an apostrophe term all return
+  exactly what the slow query returns.
+- **Trust the index** (#387). The client no longer compares the index against
+  the eleven searched properties or falls back to a label scan when it falls
+  short. What the index covers is what is searchable.
+
+Separately, **rebuilding an index fixes the loss outright**. `yakuba-vnc` was
+rebuilt through the normal pipeline on 2026-09-24 and went from 3/11 coverage
+to 11/11; its worst term went from 318 of 21,183 rows to 21,182 of 21,182.
+That is the remedy these tools exist to point at.
 
 ## Findings, 2026-09-23
 

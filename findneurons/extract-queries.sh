@@ -49,7 +49,17 @@ const grab = (marker) => {
   return src.slice(a + 1, b);
 };
 const NAME = 'find_neurons_fulltext_properties_index';
+// The client has wrapped the term in helpers over time. Map every form it
+// has used onto the placeholders the other scripts substitute:
+//   TERM    the raw search term, for the Cypher literals
+//   BODY    the bodyId
+//   LUCENE  the fulltext query string, which since v1.72.3 is built by
+//           buildLuceneQuery rather than being '*' + q + '*'
+// Older revisions have no LUCENE placeholder; they build it inline in Cypher,
+// so the substitution is simply a no-op there.
 const subst = (s) => s === null ? null : s
+  .replace(/\\\$\{buildLuceneQuery\(inputValue\)\}/g, 'LUCENE')
+  .replace(/\\\$\{escapeForCypher\(inputValue\)\}/g, 'TERM')
   .replace(/\\\$\{inputValue\}/g, 'TERM')
   .replace(/\\\$\{bodyId\}/g, 'BODY')
   .replace(/\\\$\{FULLTEXT_INDEX_NAME\}/g, NAME);
@@ -71,5 +81,10 @@ if (missing.length) {
   process.exit(1);
 }
 " "$JSX" "$OUT" || exit 1
+
+# Ship the token rule alongside the queries so the consuming scripts have a
+# single implementation to fill the LUCENE placeholder with.
+cp "$(dirname "$0")/lucene.py" "$OUT/lucene.py" 2>/dev/null || true
+chmod +x "$OUT/lucene.py" 2>/dev/null || true
 
 echo "extracted from ${REF} into ${OUT}"

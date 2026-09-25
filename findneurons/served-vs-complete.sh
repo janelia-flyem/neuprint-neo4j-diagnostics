@@ -70,6 +70,23 @@ print(json.dumps({'error': 'HTTP ' + sys.argv[2] + ': ' + open(sys.argv[1]).read
     fi
 }
 
+
+# Fill a query template. LUCENE is only present for clients from v1.72.3
+# onward, which build the fulltext string in JavaScript; earlier ones build it
+# inline in Cypher and the substitution is a no-op.
+fill_query() {   # $1=template $2=term $3=bodyId $4=output
+    local lucene=""
+    if grep -q 'LUCENE' "$1"; then
+        if [ -x "$Q/lucene.py" ]; then
+            lucene=$("$Q/lucene.py" "$2")
+        else
+            echo "ERROR: $1 needs LUCENE but $Q/lucene.py is missing -- re-run extract-queries.sh" 1>&2
+            return 1
+        fi
+    fi
+    sed -e "s/TERM/$2/g" -e "s/BODY/$3/g" -e "s/LUCENE/${lucene}/g" "$1" > "$4"
+}
+
 DS_LIST=$(curl -sS -m 60 "$S/api/dbmeta/datasets" ${AUTH[@]+"${AUTH[@]}"} | python3 -c "
 import json, sys
 try: d = json.load(sys.stdin)
@@ -120,8 +137,8 @@ except Exception:
     print('slow')
 PY
 )
-    sed -e "s/TERM/$TERM/g" -e "s/BODY/0/g" "$Q/$DEC.cypher" > "$W/served.cypher"
-    sed -e "s/TERM/$TERM/g" -e "s/BODY/0/g" "$Q/slow.cypher" > "$W/truth.cypher"
+    fill_query "$Q/$DEC.cypher" "$TERM" 0 "$W/served.cypher" || continue
+    fill_query "$Q/slow.cypher" "$TERM" 0 "$W/truth.cypher" || continue
     post "$DS" "$W/served.cypher" > "$W/s.json"
     post "$DS" "$W/truth.cypher"  > "$W/t.json"
     python3 - "$DS" "$DEC" "$W/s.json" "$W/t.json" <<'PY'
