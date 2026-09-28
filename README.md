@@ -117,9 +117,10 @@ branch, unmerged as of this writing — see [PR #71][pr].
 
 A second set, for neuPrintExplorer's neuron autocomplete rather than for
 index health. The autocomplete picks between a fulltext-index query and a
-label scan per dataset, and the two only agree if the index covers all
-eleven properties the search ranks on. When it does not, results go missing
-silently.
+label scan per dataset, and the two agree only while the index covers every
+property that dataset actually populates — which is deliberately fewer than
+the eleven the search ranks on. When a populated property falls outside the
+index, results go missing silently.
 
 These measure that: index coverage per dataset, rows a user actually receives
 versus the complete set, and the remediation DDL. See

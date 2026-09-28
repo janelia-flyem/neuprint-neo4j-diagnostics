@@ -8,10 +8,18 @@ Tools for auditing the neuron autocomplete in neuPrintExplorer's
 - **`buildFastQuery`** — finds candidates through the
   `find_neurons_fulltext_properties_index` fulltext index, then ranks them.
 
-The fast one is only equivalent if the index covers all eleven properties. If
-it covers fewer, a neuron whose only match is in an uncovered property is
-never retrieved, and the search silently returns fewer rows — no error
-anywhere. These scripts measure that.
+The fast one is equivalent as long as the index covers every property the
+dataset actually populates — which is not the same as covering all eleven.
+Where a populated property is outside the index, a neuron whose only match is
+in that property is never retrieved, and the search silently returns fewer
+rows, with no error anywhere. These scripts measure that.
+
+The distinction matters because the index is meant to be narrower than the
+query. `flyem-snapshot` indexes `type`, `instance` and `synonyms` by default
+and a dataset that annotates more lists what it needs in its own config, so a
+three-property index is correct for a dataset that populates only those three
+and a defect for one that does not. Raw coverage — `3/11` — is therefore a
+hint, not a verdict.
 
 Everything here is **read-only** except `gen-index-fix.sh`, which only prints
 statements for you to review.
@@ -141,18 +149,26 @@ neuPrintExplorer **v1.72.3**, and both validated against
   the eleven searched properties or falls back to a label scan when it falls
   short. What the index covers is what is searchable.
 
-Separately, **rebuilding an index fixes the loss outright**. `yakuba-vnc` was
-rebuilt on 2026-09-24 and went from 3/11 coverage to 11/11; its worst term
+Separately, **widening a dataset's index fixes the loss outright**.
+`yakuba-vnc` went from 3/11 coverage to 11/11 on 2026-09-24 and its worst term
 went from 318 of 21,183 rows to 21,182 of 21,182. That is the remedy these
 tools exist to point at.
 
-Note how that was achieved, because it is not yet automatic: the eleven
+Note how that was achieved, because a rebuild on its own would not have done
+it, and because it is the intended mechanism rather than a stopgap: the eleven
 properties were listed explicitly under
 `find-neurons-fulltext-index-properties` in `yakuba/yakuba-master-snapshot.yaml`
-in the `snapshot-configs` repository. `flyem-snapshot`'s **default is still
-three** on master, so a dataset whose config does not set the list keeps
-getting a three-property index however often it is rebuilt. Each dataset needs
-that config edit until `644158a` reaches master.
+in the `snapshot-configs` repository. Once listed, every nightly rebuild picks
+them up — yakuba's 11/11 index came out of the ordinary automated build, not a
+hand-run `CREATE INDEX`.
+
+`flyem-snapshot`'s default stays at three properties deliberately, so a dataset
+whose config does not extend the list keeps getting a three-property index
+however often it is rebuilt. That is the design, not a gap waiting to be
+closed: indexing a property no node carries costs build time and index size for
+nothing, and most datasets annotate only a few. A dataset that annotates more
+says so in its own config. So the remedy for a losing dataset is a one-line
+config edit, and it is permanent.
 
 ## Findings, 2026-09-23
 
@@ -179,11 +195,13 @@ Three things worth knowing when reading numbers like these:
   absent one — and fish2 is under active annotation.
 - **They drift.** yakuba measured 5,983/9,541 one day and 6,002/9,564 the
   next. Do not treat a figure as exact.
-- **The incomplete index comes from the ingestion pipeline.** `fish2:v0.6`
-  became `fish2:v0.7` within a week, built with the same 3/11 index.
-  `flyem-snapshot` emits all eleven properties as of commit `644158a`, which
-  at the time of writing is on its `neo4j-5-upgrade` branch and not on master
-  — so rebuilt datasets keep getting the incomplete index until that lands.
+- **A rebuild does not fix it; a config edit does.** `fish2:v0.6` became
+  `fish2:v0.7` within a week, built with the same three-property index,
+  because nothing in `fish2`'s config asked for more. Rebuilding reproduces
+  whatever the config says, so a dataset stays exposed until someone extends
+  `find-neurons-fulltext-index-properties` for it. Expect no upstream change
+  to do this for you — `flyem-snapshot`'s narrow default is intentional and
+  `a93dd1d` keeps it that way.
 
 ## Related
 
@@ -192,6 +210,13 @@ repo's `FINDNEURONS_FAST_PATH.md`. Note an index-coverage check was added
 there and then removed again (#385, reverted by #387) -- the index is the
 contract.
 
-The server-side fix is `flyem-snapshot`'s `644158a`, still on its
-`neo4j-5-upgrade` branch. Until it lands on master, a dataset gets all eleven
-properties only if its own config in `snapshot-configs` lists them.
+There is no single server-side fix to wait for. A dataset gets more than
+`type`, `instance` and `synonyms` only if its own config in `snapshot-configs`
+lists them, and that is by design — see the note under "Fixes that landed".
+
+`flyem-snapshot` does report the gap, though. Its `check-neuprint-snapshot`
+compares the index against the properties a dataset actually populates and
+emits a `WARN` when a populated one is missing, counted and repeated in the
+summary without failing the run (`a93dd1d`, on its `neo4j-5-upgrade` branch).
+That is the earliest point the exposure these scripts measure can be caught —
+at ingestion, rather than by auditing a live server afterwards.
