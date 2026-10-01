@@ -189,7 +189,7 @@ slow query.
 
 Three things worth knowing when reading numbers like these:
 
-- **The gap sets a ceiling; annotation decides how much is realised.** fish2
+- **The gap sets a ceiling; annotation decides how much is realized.** fish2
   has the same 3/11 gap as yakuba and loses nothing, because its uncovered
   properties are barely populated. That makes it a dormant failure, not an
   absent one — and fish2 is under active annotation.

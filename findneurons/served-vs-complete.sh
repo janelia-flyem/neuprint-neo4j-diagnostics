@@ -7,7 +7,7 @@
 #   ./served-vs-complete.sh <server> [term] [queries-dir]
 #
 # The queries directory comes from extract-queries.sh, and which git ref you
-# extracted decides whose behaviour is being measured:
+# extracted decides whose behavior is being measured:
 #
 #   extract-queries.sh <repo> d027001^          -> the pre-#383 client
 #   extract-queries.sh <repo> origin/master     -> whatever is on master now
@@ -94,7 +94,7 @@ except Exception: sys.exit(1)
 if not isinstance(d, dict) or d.get('error') or d.get('message') or not d: sys.exit(1)
 print('\n'.join(sorted(d)))")
 if [ -z "${DS_LIST}" ]; then
-    echo "ERROR: could not list datasets -- not authorised, or server unreachable." 1>&2
+    echo "ERROR: could not list datasets -- not authorized, or server unreachable." 1>&2
     exit 1
 fi
 

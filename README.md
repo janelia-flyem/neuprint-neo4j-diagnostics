@@ -96,7 +96,7 @@ which is what determines whether that query can run there at all.
 
 - **217 inert indexes on the live fish2 database**, 30% of its node indexes,
   from a colon in an element label (`fish2_:Soma` where nodes carry
-  `fish2_Soma`). Identical behaviour on 4.4.16 and 2026.08.1, so a
+  `fish2_Soma`). Identical behavior on 4.4.16 and 2026.08.1, so a
   pre-existing defect rather than an upgrade regression.
 - **The proposed `buildFastQuery` fix is equivalent**, not merely compilable:
   24 comparisons across every deployed dataset that can run the query, up to

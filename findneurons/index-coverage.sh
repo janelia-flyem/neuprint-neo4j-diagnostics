@@ -51,7 +51,7 @@ except Exception: sys.exit(1)
 if not isinstance(d,dict) or d.get('error') or d.get('message'): sys.exit(1)
 print('\n'.join(sorted(d)))")
 if [ -z "${DS_LIST}" ]; then
-  echo "ERROR: could not list datasets -- not authorised, or the server is unreachable." 1>&2
+  echo "ERROR: could not list datasets -- not authorized, or the server is unreachable." 1>&2
   exit 1
 fi
 

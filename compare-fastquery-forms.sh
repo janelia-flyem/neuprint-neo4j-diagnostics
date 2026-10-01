@@ -104,7 +104,7 @@ else
 fi
 
 
-# The full query, parameterised by term, bodyId and which WITH form to use.
+# The full query, parameterized by term, bodyId and which WITH form to use.
 # Only bodyId/priority/type_priority are returned, not all fourteen columns:
 # every other column is a plain property of n, so if the set of
 # (bodyId, priority, type_priority) agrees -- and DISTINCT guarantees one row
