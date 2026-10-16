@@ -88,8 +88,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from common.style import (Reporter, Style, add_color_argument,  # noqa: E402
-                          want_color)
+from common.style import (Reporter, Style, add_baseline_argument,  # noqa: E402
+                          add_color_argument, load_baseline, want_color)
 
 HERE = Path(__file__).resolve().parent
 RESULTS = HERE.parent / 'results'        # one results/ dir shared by every tool
@@ -1041,6 +1041,7 @@ def main(argv):
     p.add_argument('--no-report', action='store_true',
                    help='do not write results/<a>-vs-<b>-<stamp>.txt')
     add_color_argument(p)
+    add_baseline_argument(p)
     args = p.parse_args(argv[1:])
 
     if not args.targets:
@@ -1054,7 +1055,8 @@ def main(argv):
               file=sys.stderr)
         return 2
 
-    rep = Reporter(Style(want_color(args.color)))
+    rep = Reporter(Style(want_color(args.color)),
+                   baseline=load_baseline(args.baseline))
     started = datetime.now(timezone.utc)
     rep(f'compare-datasets  {started.strftime("%Y-%m-%d %H:%M:%SZ")}')
     rep(f'  A  {a.server}  dataset {a.dataset}')
@@ -1103,17 +1105,15 @@ def main(argv):
         if not enabled:
             rep(f'  {name:<22} {rep.s.dim("skipped")}')
             continue
+        # Neutral wording on purpose: whether a flagged layer is a failure is
+        # decided by the findings below -- it may be only warnings, or a
+        # difference the baseline accepts -- and RESULT says which.
         rep(f'  {name:<22} '
-            f'{rep.s.green("identical") if good else rep.s.red("DIFFERENCES FOUND")}')
+            f'{rep.s.green("identical") if good else rep.s.yellow("see findings")}')
 
-    n_diff, n_warn = rep.counts()
-    if rep.findings:
-        rep(f'\n--- findings ({n_diff} difference(s), {n_warn} warning(s)) ---')
-        rep(rep.s.dim('  Everything flagged above, collected so a long report '
-                      'cannot hide one.'))
-        for sev, text in rep.findings:
-            tag = rep.s.red('DIFF') if sev == 'DIFF' else rep.s.yellow('WARN')
-            rep(f'  {tag}  {text}')
+    # Shared, so the roll-up, the baseline and the "how to accept this"
+    # hint behave identically in every tool that reports findings.
+    n_diff, n_warn = rep.print_findings()
 
     if rep.fatals:
         rep(f'\n--- could not complete ({len(rep.fatals)}) ---')
@@ -1123,7 +1123,15 @@ def main(argv):
         rep(rep.s.dim('This is not evidence that the instances differ.'))
         exit_code = 2
     else:
-        ok = data_same and conn_same and index_same and endpoints_same
+        # The verdict follows the findings, not the per-layer booleans.
+        # Two consequences, both intended:
+        #   * a difference accepted by the baseline does not fail the run,
+        #     which is the whole point of having one;
+        #   * a WARNING no longer fails it either, so the WARN/DIFF
+        #     distinction finally means something. "Same rows, different
+        #     order" is not a difference in the data, and failing on it
+        #     trains you to ignore a red verdict.
+        ok = n_diff == 0
         verdict = (rep.s.green('OK -- instances look equivalent') if ok
                    else rep.s.red('DIFFERENCES FOUND -- see findings above'))
         rep(f'\nRESULT: {verdict}')
