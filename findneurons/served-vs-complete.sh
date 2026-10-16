@@ -24,6 +24,9 @@
 # worst case we found was among the hidden ones.
 set -uo pipefail
 
+# Shared palette (COLOR=always|never|auto, NO_COLOR respected).
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
+
 S=${1:?usage: served-vs-complete.sh <server> [term] [queries-dir]}
 TERM=${2:-a}
 Q=${3:-./queries}
@@ -32,7 +35,7 @@ AUTH=(); [ -n "${TOKEN}" ] && AUTH=(-H "Authorization: Bearer ${TOKEN}")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 
 for f in fast slow version index; do
-    [ -r "$Q/$f.cypher" ] || { echo "ERROR: $Q/$f.cypher missing -- run extract-queries.sh first" 1>&2; exit 2; }
+    [ -r "$Q/$f.cypher" ] || { echo "${C_RED}ERROR${C_RESET}: $Q/$f.cypher missing -- run extract-queries.sh first" 1>&2; exit 2; }
 done
 
 # The eleven properties both search queries rank on.
@@ -80,7 +83,7 @@ fill_query() {   # $1=template $2=term $3=bodyId $4=output
         if [ -x "$Q/lucene.py" ]; then
             lucene=$("$Q/lucene.py" "$2")
         else
-            echo "ERROR: $1 needs LUCENE but $Q/lucene.py is missing -- re-run extract-queries.sh" 1>&2
+            echo "${C_RED}ERROR${C_RESET}: $1 needs LUCENE but $Q/lucene.py is missing -- re-run extract-queries.sh" 1>&2
             return 1
         fi
     fi
@@ -94,7 +97,7 @@ except Exception: sys.exit(1)
 if not isinstance(d, dict) or d.get('error') or d.get('message') or not d: sys.exit(1)
 print('\n'.join(sorted(d)))")
 if [ -z "${DS_LIST}" ]; then
-    echo "ERROR: could not list datasets -- not authorized, or server unreachable." 1>&2
+    echo "${C_RED}ERROR${C_RESET}: could not list datasets -- not authorized, or server unreachable." 1>&2
     exit 1
 fi
 
@@ -142,7 +145,10 @@ PY
     post "$DS" "$W/served.cypher" > "$W/s.json"
     post "$DS" "$W/truth.cypher"  > "$W/t.json"
     python3 - "$DS" "$DEC" "$W/s.json" "$W/t.json" <<'PY'
-import json, sys
+import json, os, sys
+# Palette from common/colors.sh via the environment -- this heredoc is quoted.
+R, Y, G, D, Z = (os.environ.get(k, '')
+                 for k in ('C_RED', 'C_YELLOW', 'C_GREEN', 'C_DIM', 'C_RESET'))
 ds, dec = sys.argv[1], sys.argv[2]
 def rows(p):
     try: d = json.load(open(p))
@@ -151,9 +157,15 @@ def rows(p):
     return {r[0] for r in d.get('data') or []}
 sv, tr = rows(sys.argv[3]), rows(sys.argv[4])
 if sv is None or tr is None:
-    print(f"{ds:<24} {dec:<10} {'query error':>10}"); raise SystemExit
+    print(f"{ds:<24} {dec:<10} {R}{'query error':>10}{Z}"); raise SystemExit
 lost = len(tr - sv)
 pct = 100.0 * lost / len(tr) if tr else 0.0
-print(f"{ds:<24} {dec:<10} {len(sv):>10} {len(tr):>10} {lost:>8} {pct:>7.1f}%")
+# LOST is rows a real user never sees -- the whole reason this script exists.
+# Pad inside the color so the columns stay aligned.
+mark = R if lost else G
+# 'fast' is the path that can lose rows; 'slow' is ground truth, so dim it.
+dec_shown = f"{Y}{dec:<10}{Z}" if dec == 'fast' else f"{D}{dec:<10}{Z}"
+print(f"{ds:<24} {dec_shown} {len(sv):>10} {len(tr):>10} "
+      f"{mark}{lost:>8}{Z} {mark}{pct:>7.1f}%{Z}")
 PY
 done <<< "${DS_LIST}"

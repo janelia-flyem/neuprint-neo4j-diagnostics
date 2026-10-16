@@ -18,6 +18,9 @@
 #
 set -uo pipefail
 
+# Shared palette (COLOR=always|never|auto, NO_COLOR respected).
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
+
 CS=${CYPHER_SHELL:-cypher-shell}
 DB=${NEO4J_DB:-neo4j}
 # stdin is redirected from /dev/null: CYPHER_SHELL may be a `docker exec -i`
@@ -57,14 +60,24 @@ while IFS= read -r line; do
     fi
 done <<< "${COUNTS}"
 
-printf '%s' "${REPORT}" | sort -k1,1r -k2
+# REPORT is built and sorted uncolored -- an escape sequence in the leading
+# field would corrupt the sort key -- so the color goes on afterwards, and
+# only over text whose visible width does not change.
+printf '%s' "${REPORT}" | sort -k1,1r -k2 | sed \
+    -e "s/^  INERT /  ${C_RED}INERT${C_RESET} /" \
+    -e "s/^  ok    /  ${C_GREEN}ok${C_RESET}    /"
 echo
 echo "  node indexes total : ${TOTAL_IDX}"
 echo "  on live labels     : $(( TOTAL_IDX - INERT_IDX ))  (${LIVE_LBL} label(s))"
-if [[ "${TOTAL_IDX}" -gt 0 ]]; then
-    echo "  INERT              : ${INERT_IDX}  (${INERT_LBL} label(s))  = $(( 100 * INERT_IDX / TOTAL_IDX ))% of node indexes"
+if [[ "${INERT_IDX}" -gt 0 ]]; then
+    INERT_C="${C_RED}"
 else
-    echo "  INERT              : ${INERT_IDX}"
+    INERT_C="${C_GREEN}"
+fi
+if [[ "${TOTAL_IDX}" -gt 0 ]]; then
+    echo "  INERT              : ${INERT_C}${INERT_IDX}${C_RESET}  (${INERT_LBL} label(s))  = ${INERT_C}$(( 100 * INERT_IDX / TOTAL_IDX ))%${C_RESET} of node indexes"
+else
+    echo "  INERT              : ${INERT_C}${INERT_IDX}${C_RESET}"
 fi
 echo
-[[ "${INERT_IDX}" -gt 0 ]] && echo "  An inert index reports ONLINE at 100% while covering nothing." || echo "  No inert indexes found."
+[[ "${INERT_IDX}" -gt 0 ]] && echo "  ${C_YELLOW}An inert index reports ONLINE at 100% while covering nothing.${C_RESET}" || echo "  ${C_GREEN}No inert indexes found.${C_RESET}"

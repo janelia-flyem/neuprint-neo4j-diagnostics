@@ -15,22 +15,28 @@
 # cypher-shell -- prefer that if you have container or host access.
 #
 # Usage:
-#   export NEUPRINT_TOKEN=<your token>
+#   export NEUPRINT_JWT=<your token>
 #   ./audit-inert-indexes-http.sh https://neuprint-fish2.janelia.org fish2
 #   ./audit-inert-indexes-http.sh https://neuprint.janelia.org      # all datasets
 #
+# Auth: set NEUPRINT_JWT (or NEUPRINT_TOKEN), as every other script here does.
+#
 set -uo pipefail
+
+# Shared palette (COLOR=always|never|auto, NO_COLOR respected).
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
 
 SERVER=${1:-}
 DATASET=${2:-}
+TOKEN=${NEUPRINT_JWT:-${NEUPRINT_TOKEN:-}}
 
-if [[ -z "${NEUPRINT_TOKEN:-}" ]]; then
+if [[ -z "${TOKEN}" ]]; then
     cat <<'MSG' 1>&2
-ERROR: NEUPRINT_TOKEN is not set.
+ERROR: neither NEUPRINT_JWT nor NEUPRINT_TOKEN is set.
 
   Get a token from your neuPrint server's account page, then:
 
-    export NEUPRINT_TOKEN='<token>'
+    export NEUPRINT_JWT='<token>'
 
   It is a bearer credential -- prefer exporting it in your shell over pasting
   it into a command line, which lands in your shell history.
@@ -57,7 +63,7 @@ trap 'rm -rf "${WORK}"' EXIT
 post() {  # $1 = json payload file
     curl -sS -X POST "${SERVER}/api/custom/custom" \
         -H 'Content-Type: application/json' \
-        -H "Authorization: Bearer ${NEUPRINT_TOKEN}" \
+        -H "Authorization: Bearer ${TOKEN}" \
         -d @"$1"
 }
 
@@ -132,15 +138,21 @@ PY
     fi
 
     python3 - "${pfx}.r2" "${ds}" "${WORK}/tally" <<'PY'
-import json, sys
+import json, os, sys
+# The palette comes from common/colors.sh via the environment; this heredoc is
+# quoted, so nothing is substituted by the shell.
+R, G, Z = (os.environ.get(k, '') for k in ('C_RED', 'C_GREEN', 'C_RESET'))
 rows = json.load(open(sys.argv[1]))['data']
 total = sum(r[1] for r in rows)
 inert = sum(r[1] for r in rows if r[2] == 0)
 for label, idx, nodes in sorted(rows, key=lambda r: (r[2] != 0, r[0])):
-    tag = "INERT" if nodes == 0 else "ok   "
+    # Pad first, color second: the escape codes must not count toward a width.
+    tag = f"{R}INERT{Z}" if nodes == 0 else f"{G}{'ok':<5}{Z}"
     print(f"  {tag}  {label:<34}{idx:>5} index(es){nodes:>14,} nodes")
+mark = R if inert else G
 print(f"\n  node indexes {total}, on live labels {total - inert}, "
-      f"INERT {inert}" + (f" = {100 * inert // total}%" if total else ""))
+      f"{mark}INERT {inert}" + (f" = {100 * inert // total}%" if total else "")
+      + Z)
 open(sys.argv[3], 'a').write(f"{sys.argv[2]} {total} {inert}\n")
 PY
 }
@@ -151,7 +163,7 @@ if [[ -n "${DATASET}" ]]; then
 else
     echo "No dataset given -- enumerating datasets on ${SERVER}"
     curl -sS "${SERVER}/api/dbmeta/datasets" \
-        -H "Authorization: Bearer ${NEUPRINT_TOKEN}" > "${WORK}/ds.json"
+        -H "Authorization: Bearer ${TOKEN}" > "${WORK}/ds.json"
     # The endpoint returns an object keyed by dataset name.
     DATASETS=$(python3 - "${WORK}/ds.json" <<'PY'
 import json, sys
@@ -188,7 +200,8 @@ if [[ "$(echo "${DATASETS}" | grep -c .)" -gt 1 ]]; then
     echo "=============================================================="
     if [[ -s "${WORK}/tally" ]]; then
         python3 - "${WORK}/tally" <<'PY'
-import sys
+import os, sys
+R, G, Z = (os.environ.get(k, '') for k in ('C_RED', 'C_GREEN', 'C_RESET'))
 rows = [l.split() for l in open(sys.argv[1]) if l.strip()]
 w = max(len(r[0]) for r in rows)
 gt = gi = 0
@@ -196,10 +209,12 @@ for ds, total, inert in rows:
     total, inert = int(total), int(inert)
     gt += total; gi += inert
     pct = f"{100 * inert // total}%" if total else "-"
-    flag = "  <-- inert indexes present" if inert else ""
+    # Trailing text only, so the columns above it stay aligned.
+    flag = f"  {R}<-- inert indexes present{Z}" if inert else ""
     print(f"  {ds:<{w}}  {total:>5} node indexes  {inert:>5} inert  {pct:>5}{flag}")
-print(f"\n  across {len(rows)} dataset(s): {gt} node indexes, {gi} inert"
-      + (f" = {100 * gi // gt}%" if gt else ""))
+mark = R if gi else G
+print(f"\n  across {len(rows)} dataset(s): {gt} node indexes, {mark}{gi} inert"
+      + (f" = {100 * gi // gt}%" if gt else "") + Z)
 PY
     else
         echo "  no datasets could be audited"

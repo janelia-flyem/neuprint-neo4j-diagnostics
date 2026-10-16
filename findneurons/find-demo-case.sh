@@ -8,6 +8,9 @@
 #
 # Reads NEUPRINT_JWT / NEUPRINT_TOKEN; never prints or stores the token.
 set -uo pipefail
+
+# Shared palette (COLOR=always|never|auto, NO_COLOR respected).
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
 S=$1; DS=$2
 TOKEN=${NEUPRINT_JWT:-${NEUPRINT_TOKEN:-}}
 AUTH=(); [ -n "${TOKEN}" ] && AUTH=(-H "Authorization: Bearer ${TOKEN}")
@@ -33,7 +36,7 @@ print(json.dumps({'error': 'HTTP ' + sys.argv[2] + ': ' + open(sys.argv[1]).read
   fi
 }
 
-echo "=== most common 'class' values (class is indexed nowhere, but searched) ==="
+echo "${C_CYAN}=== most common 'class' values (class is indexed nowhere, but searched) ===${C_RESET}"
 run "MATCH (n:Neuron) WHERE n.class IS NOT NULL
 RETURN n.class AS class, count(*) AS neurons
 ORDER BY neurons DESC LIMIT 8" | python3 -c "
@@ -43,7 +46,7 @@ if d.get('error'): print('  error:', d['error'][:120]); raise SystemExit
 for c,n in d.get('data') or []: print(f'  {n:>8}  {c}')"
 
 echo
-echo "=== a neuron findable by class but NOT by type/instance/synonyms ==="
+echo "${C_CYAN}=== a neuron findable by class but NOT by type/instance/synonyms ===${C_RESET}"
 echo "    (type its class value in the search box: it should be offered, and will not be)"
 run "MATCH (n:Neuron)
 WHERE n.class IS NOT NULL

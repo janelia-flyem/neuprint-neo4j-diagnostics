@@ -13,6 +13,9 @@
 # a request header -- it is never printed, written to a file, or placed on a
 # command line, so the output of this script is safe to share.
 set -uo pipefail
+
+# Shared palette (COLOR=always|never|auto, NO_COLOR respected).
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
 S=${1:-https://neuprint.janelia.org}
 TOKEN=${NEUPRINT_JWT:-${NEUPRINT_TOKEN:-}}
 AUTH=()
@@ -51,7 +54,7 @@ except Exception: sys.exit(1)
 if not isinstance(d,dict) or d.get('error') or d.get('message'): sys.exit(1)
 print('\n'.join(sorted(d)))")
 if [ -z "${DS_LIST}" ]; then
-  echo "ERROR: could not list datasets -- not authorized, or the server is unreachable." 1>&2
+  echo "${C_RED}ERROR${C_RESET}: could not list datasets -- not authorized, or the server is unreachable." 1>&2
   exit 1
 fi
 
@@ -62,17 +65,24 @@ while IFS= read -r DS; do
   [ -z "$DS" ] && continue
   post "$DS" "$W/idx.cypher" > "$W/i.json"
   python3 - "$DS" "$W/i.json" "$PROPS" <<'PY'
-import json,sys
+import json,os,sys
+# Palette from common/colors.sh via the environment -- this heredoc is quoted.
+R, Y, G, D, Z = (os.environ.get(k, '')
+                 for k in ('C_RED', 'C_YELLOW', 'C_GREEN', 'C_DIM', 'C_RESET'))
 ds,f,props = sys.argv[1], sys.argv[2], sys.argv[3].split()
 try: d=json.load(open(f))
 except Exception: d={}
 rows = d.get('data') or []
 if d.get('error') or not rows:
     why = 'no such index' if not d.get('error') else 'query failed (3.5 server?)'
-    print(f"{ds:<24} {'n/a':<9} {'-':<8} ({why})"); raise SystemExit
+    print(f"{ds:<24} {Y}{'n/a':<9}{Z} {'-':<8} {D}({why}){Z}"); raise SystemExit
 state, properties = rows[0][0], rows[0][1] or []
 missing = [p for p in props if p not in properties]
-print(f"{ds:<24} {state:<9} {str(len(props)-len(missing))+'/11':<8} "
-      f"{', '.join(missing) if missing else '(complete)'}")
+# An uncovered property is a silent row loss, so the gap is what to see first.
+state_c = G if state == 'ONLINE' else R
+cov_c = G if not missing else Y
+print(f"{ds:<24} {state_c}{state:<9}{Z} "
+      f"{cov_c}{str(len(props)-len(missing))+'/11':<8}{Z} "
+      + (f"{Y}{', '.join(missing)}{Z}" if missing else f"{G}(complete){Z}"))
 PY
 done <<< "${DS_LIST}"

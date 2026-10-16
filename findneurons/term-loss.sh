@@ -14,6 +14,9 @@
 # ever used in a request header, never printed or written down. Output is row
 # counts only, so it is safe to share.
 set -uo pipefail
+
+# Shared palette (COLOR=always|never|auto, NO_COLOR respected).
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
 S=${1:?usage: term-loss.sh <server> <dataset> [terms] [queries-dir]}
 DS=${2:?dataset required}
 TERMS=${3:-lc,a,dn,ps}
@@ -41,7 +44,7 @@ print(json.dumps({'error': 'HTTP ' + sys.argv[2] + ': ' + open(sys.argv[1]).read
   fi
 }
 for f in fast slow; do
-  [ -r "$Q/$f.cypher" ] || { echo "ERROR: $Q/$f.cypher missing -- run extract-queries.sh first" 1>&2; exit 2; }
+  [ -r "$Q/$f.cypher" ] || { echo "${C_RED}ERROR${C_RESET}: $Q/$f.cypher missing -- run extract-queries.sh first" 1>&2; exit 2; }
 done
 echo "$DS on $S   (fast query vs slow query, from $Q)"
 
@@ -54,7 +57,7 @@ fill_query() {   # $1=template $2=term $3=bodyId $4=output
         if [ -x "$Q/lucene.py" ]; then
             lucene=$("$Q/lucene.py" "$2")
         else
-            echo "ERROR: $1 needs LUCENE but $Q/lucene.py is missing -- re-run extract-queries.sh" 1>&2
+            echo "${C_RED}ERROR${C_RESET}: $1 needs LUCENE but $Q/lucene.py is missing -- re-run extract-queries.sh" 1>&2
             return 1
         fi
     fi
@@ -69,7 +72,9 @@ for t in "${TL[@]}"; do
     post "$W/$f.cypher" > "$W/$f.json"
   done
   python3 - "$t" "$W/fast.json" "$W/slow.json" <<'PY'
-import json,sys
+import json,os,sys
+# Palette from common/colors.sh via the environment -- this heredoc is quoted.
+R, G, Z = (os.environ.get(k, '') for k in ('C_RED', 'C_GREEN', 'C_RESET'))
 t=sys.argv[1]
 def rows(p):
     d=json.load(open(p))
@@ -77,8 +82,12 @@ def rows(p):
     return {r[0] for r in d.get('data') or []}
 f,s = rows(sys.argv[2]), rows(sys.argv[3])
 if f is None or s is None:
-    print(f"{t:<10} {'query error':>10}"); raise SystemExit
+    print(f"{t:<10} {R}{'query error':>10}{Z}"); raise SystemExit
 lost=len(s-f); pct=100.0*lost/len(s) if s else 0.0
-print(f"{t:<10} {len(f):>10} {len(s):>10} {lost:>10} {pct:>8.1f}%")
+# Lost rows are the whole point of this script: rows a real user never sees.
+# Pad inside the color so the columns stay aligned.
+mark = R if lost else G
+print(f"{t:<10} {len(f):>10} {len(s):>10} "
+      f"{mark}{lost:>10}{Z} {mark}{pct:>8.1f}%{Z}")
 PY
 done
