@@ -20,18 +20,21 @@
 # you compare "what users get today" against "what this branch would do".
 set -uo pipefail
 
+# Shared palette (COLOR=always|never|auto, NO_COLOR respected).
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
+
 REPO=${1:?usage: extract-queries.sh <path-to-neuPrintExplorer> [git-ref] [outdir]}
 REF=${2:-HEAD}
 OUT=${3:-./queries}
 SRC=src/js/plugins/query/shared/NeuronInputField.jsx
 
-command -v node > /dev/null || { echo "ERROR: node is required" 1>&2; exit 2; }
-[ -d "$REPO/.git" ] || { echo "ERROR: $REPO is not a git checkout" 1>&2; exit 2; }
+command -v node > /dev/null || { echo "${C_RED}ERROR${C_RESET}: node is required" 1>&2; exit 2; }
+[ -d "$REPO/.git" ] || { echo "${C_RED}ERROR${C_RESET}: $REPO is not a git checkout" 1>&2; exit 2; }
 
 mkdir -p "$OUT"
 JSX="$(mktemp)"; trap 'rm -f "$JSX"' EXIT
 if ! git -C "$REPO" show "${REF}:${SRC}" > "$JSX" 2>/dev/null; then
-    echo "ERROR: cannot read ${SRC} at ${REF} in ${REPO}" 1>&2
+    echo "${C_RED}ERROR${C_RESET}: cannot read ${SRC} at ${REF} in ${REPO}" 1>&2
     exit 1
 fi
 

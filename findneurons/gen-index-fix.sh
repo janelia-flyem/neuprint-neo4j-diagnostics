@@ -9,6 +9,12 @@
 # PRINTS ONLY -- it executes nothing. Review the output before running it.
 # Reads NEUPRINT_JWT / NEUPRINT_TOKEN; never prints or stores the token.
 set -uo pipefail
+
+# NO COLOR HERE, deliberately. This script emits Cypher DDL meant to be
+# piped into cypher-shell or copied into a client. An escape sequence in
+# generated DDL corrupts it, and COLOR=auto only protects the piped case --
+# someone running this on a terminal and copying the output would carry
+# invisible codes into their statements.
 S=$1; DS=$2
 TOKEN=${NEUPRINT_JWT:-${NEUPRINT_TOKEN:-}}
 AUTH=(); [ -n "${TOKEN}" ] && AUTH=(-H "Authorization: Bearer ${TOKEN}")

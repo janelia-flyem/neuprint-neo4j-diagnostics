@@ -19,15 +19,16 @@
 # Read-only. Two query forms x two bodyId cases per dataset, plus one sample.
 #
 # Usage:
-#   export NEUPRINT_TOKEN=<token>
+#   export NEUPRINT_JWT=<token>
 #   ./compare-fastquery-forms.sh                    # every dataset, all servers
 #   ./compare-fastquery-forms.sh https://neuprint.janelia.org   # one server, all
 #   ./compare-fastquery-forms.sh https://neuprint-fish2.janelia.org fish2
 #   TERMS=lc ./compare-fastquery-forms.sh           # one term: much quicker
 #   LIST_ONLY=1 ./compare-fastquery-forms.sh        # plan + version survey only
 #
-# NOTE ON TOKENS: one token authenticates against all four servers -- they share
-# an auth backend. A server that cannot be listed is reported and skipped rather
+# NOTE ON TOKENS: set NEUPRINT_JWT (or NEUPRINT_TOKEN), as every other script
+# here does. One token authenticates against all four servers -- they share an
+# auth backend. A server that cannot be listed is reported and skipped rather
 # than aborting the run.
 #
 # NOTE ON RUNTIME: a full sweep is 2 + 4 x |TERMS| queries per dataset, and a
@@ -37,6 +38,9 @@
 # a big sorted set is the interesting evidence.
 #
 set -uo pipefail
+
+# Shared palette (COLOR=always|never|auto, NO_COLOR respected).
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
 
 TERMS=${TERMS:-lc,a}
 # One neuPrint server can front several Neo4j instances -- neuPrintHTTP's
@@ -49,9 +53,10 @@ https://neuprint-pre.janelia.org
 https://neuprint-yakuba.janelia.org
 https://neuprint-fish2.janelia.org"
 
-if [[ -z "${NEUPRINT_TOKEN:-}" ]]; then
-    echo "ERROR: NEUPRINT_TOKEN is not set." 1>&2
-    echo "  export NEUPRINT_TOKEN='<token>'   (one token covers all four servers)" 1>&2
+TOKEN=${NEUPRINT_JWT:-${NEUPRINT_TOKEN:-}}
+if [[ -z "${TOKEN}" ]]; then
+    echo "${C_RED}ERROR${C_RESET}: neither NEUPRINT_JWT nor NEUPRINT_TOKEN is set." 1>&2
+    echo "  export NEUPRINT_JWT='<token>'   (one token covers all four servers)" 1>&2
     exit 2
 fi
 command -v python3 > /dev/null || { echo "ERROR: python3 is required." 1>&2; exit 2; }
@@ -63,7 +68,7 @@ WORK=$(mktemp -d); trap 'rm -rf "${WORK}"' EXIT
 # every dataset on every server in SERVERS_DEFAULT.
 list_datasets() {  # $1 = server
     curl -sS -m 120 "$1/api/dbmeta/datasets" \
-        -H "Authorization: Bearer ${NEUPRINT_TOKEN}" 2>/dev/null \
+        -H "Authorization: Bearer ${TOKEN}" 2>/dev/null \
     | python3 -c "
 import json, sys
 try:
@@ -95,7 +100,7 @@ else
         done <<< "${ds}"
     done <<< "${SERVERS}"
     if [[ -z "${PAIRS}" ]]; then
-        echo "ERROR: no datasets found on any server. Check the token." 1>&2
+        echo "${C_RED}ERROR${C_RESET}: no datasets found on any server. Check the token." 1>&2
         exit 1
     fi
     nterms=$(( $(echo "${TERMS}" | tr ',' '\n' | grep -c .) ))
@@ -137,7 +142,7 @@ print(json.dumps({"dataset": sys.argv[1], "cypher": open(sys.argv[2]).read()}))
 PY
     curl -sS -m 300 -X POST "$1/api/custom/custom" \
         -H 'Content-Type: application/json' \
-        -H "Authorization: Bearer ${NEUPRINT_TOKEN}" \
+        -H "Authorization: Bearer ${TOKEN}" \
         -d @"${WORK}/payload.json"
 }
 
@@ -220,39 +225,50 @@ print(' '.join(str(c) for c in d[0]) if d else 'unknown')"
 # than returning fewer rows. SHOW INDEXES is 4.x+, so 3.5 is reported as n/a.
 FULLTEXT_INDEX=find_neurons_fulltext_properties_index
 probe_fulltext() {  # $1=server $2=dataset $3=version -> status on stdout
+    # This lands in a trailing %s with no width, so coloring it here cannot
+    # disturb the columns to its left.
     case "$3" in
-        3.*)                 echo "n/a (3.5)"; return ;;
-        unreachable|unknown) echo "-";         return ;;
+        3.*)                 echo "${C_DIM}n/a (3.5)${C_RESET}"; return ;;
+        unreachable|unknown) echo "${C_DIM}-${C_RESET}";         return ;;
     esac
     echo "SHOW INDEXES YIELD name, type, state WHERE type = 'FULLTEXT' RETURN name, state" \
         > "${WORK}/fx.cypher"
     post "$1" "$2" "${WORK}/fx.cypher" > "${WORK}/fx.json"
     if [[ "$(classify "${WORK}/fx.json")" != "DATA" ]]; then
-        echo "probe failed"; return
+        echo "${C_YELLOW}probe failed${C_RESET}"; return
     fi
     python3 -c "
-import json
+import json, os
+R, Y, G, Z = (os.environ.get(k, '') for k in ('C_RED', 'C_YELLOW', 'C_GREEN', 'C_RESET'))
 d = json.load(open('${WORK}/fx.json'))['data']
 want = '${FULLTEXT_INDEX}'
 found = {r[0]: r[1] for r in d}
 if want in found:
-    print('yes' if found[want] == 'ONLINE' else 'yes but ' + str(found[want]))
+    print(G + 'yes' + Z if found[want] == 'ONLINE'
+          else Y + 'yes but ' + str(found[want]) + Z)
 elif found:
-    print('MISSING (fulltext present: ' + ','.join(sorted(found)) + ')')
+    print(R + 'MISSING' + Z + ' (fulltext present: ' + ','.join(sorted(found)) + ')')
 else:
-    print('MISSING (no fulltext index at all)')"
+    print(R + 'MISSING (no fulltext index at all)' + Z)"
 }
 
 if [[ "${LIST_ONLY:-0}" == "1" ]]; then
     echo
-    printf "  %-16s %-22s %-18s %s\n" "SERVER" "DATASET" "NEO4J" "FULLTEXT INDEX"
+    printf "  %-16s %-22s %-20s %s\n" "SERVER" "DATASET" "NEO4J" "FULLTEXT INDEX"
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
         server=${line%%|*}; dataset=${line#*|}
         host=${server#https://}; host=${host%%.*}
         v=$(probe_version  "${server}" "${dataset}"      < /dev/null)
         f=$(probe_fulltext "${server}" "${dataset}" "${v}" < /dev/null)
-        printf "  %-16s %-22s %-18s %s\n" "${host}" "${dataset}" "${v}" "${f}"
+        # Pad the version first, then color: an escape sequence counts toward
+        # %-18s and would push every following column out of line.
+        case "${v}" in
+            3.*)         v_shown="${C_YELLOW}$(printf '%-20s' "${v}")${C_RESET}" ;;
+            unreachable) v_shown="${C_RED}$(printf '%-20s' "${v}")${C_RESET}" ;;
+            *)           v_shown="$(printf '%-20s' "${v}")" ;;
+        esac
+        printf "  %-16s %-22s %s %s\n" "${host}" "${dataset}" "${v_shown}" "${f}"
     done <<< "${PAIRS}"
     echo
     echo "  A dataset needs 4.4+ (for CALL {}) AND the fulltext index above"
@@ -283,7 +299,7 @@ while IFS='|' read -r server dataset; do
     post "${server}" "${dataset}" "${WORK}/s.cypher" > "${WORK}/s.json"
     st=$(classify "${WORK}/s.json")
     if [[ "${st}" != "DATA" ]]; then
-        echo "  SKIPPED -- ${st#ERROR:}"
+        echo "  ${C_YELLOW}SKIPPED${C_RESET} -- ${st#ERROR:}"
         SKIPPED=$(( SKIPPED + 1 ))
         row "${host}" "${dataset}" "${VERSION}" "skipped: ${st#ERROR:}"
         continue
@@ -306,12 +322,12 @@ print(d[0][0] if d else 0)")
 
             label=$(printf "term='%s' bodyId=%s" "${term}" "${body}")
             if [[ "${so}" == "NOCOMPILE" ]]; then
-                printf "  %-30s original does not compile -- server is 5.x or later\n" "${label}"
+                printf "  %-30s ${C_YELLOW}original does not compile${C_RESET} -- server is 5.x or later\n" "${label}"
                 SKIPPED=$(( SKIPPED + 1 )); TOTAL=$(( TOTAL - 1 ))
                 DS_NOTE="original will not compile (5.x+)"; break 2
             fi
             if [[ "${so}" != "DATA" || "${sf}" != "DATA" ]]; then
-                printf "  %-30s ERROR  orig=%s fixed=%s\n" "${label}" "${so#ERROR:}" "${sf#ERROR:}"
+                printf "  %-30s ${C_RED}ERROR${C_RESET}  orig=%s fixed=%s\n" "${label}" "${so#ERROR:}" "${sf#ERROR:}"
                 # Print the untruncated error once, on the first failure for
                 # this dataset -- the short name above is for the table.
                 if [[ "${DS_ERR}" -eq 0 ]]; then full_error "${WORK}/o.json"; fi
@@ -326,15 +342,15 @@ print(d[0][0] if d else 0)")
             if [[ "$(rows_sorted "${WORK}/o.json")" == "$(rows_sorted "${WORK}/f.json")" ]]; then
                 AGREE=$(( AGREE + 1 ))
                 if [[ "$(rows_ordered "${WORK}/o.json")" == "$(rows_ordered "${WORK}/f.json")" ]]; then
-                    printf "  %-30s IDENTICAL  %s rows (same order too)\n" "${label}" "${n}"
+                    printf "  %-30s ${C_GREEN}IDENTICAL${C_RESET}  %s rows (same order too)\n" "${label}" "${n}"
                     DS_ID=$(( DS_ID + 1 ))
                 else
-                    printf "  %-30s SAME SET   %s rows (tie order differs -- both valid)\n" "${label}" "${n}"
+                    printf "  %-30s ${C_YELLOW}SAME SET${C_RESET}   %s rows (tie order differs -- both valid)\n" "${label}" "${n}"
                     DS_SET=$(( DS_SET + 1 ))
                 fi
             else
                 DISAGREE=$(( DISAGREE + 1 )); DS_DIFF=$(( DS_DIFF + 1 ))
-                printf "  %-30s *** DIFFER ***  orig=%s rows fixed=%s rows\n" "${label}" \
+                printf "  %-30s ${C_RED}*** DIFFER ***${C_RESET}  orig=%s rows fixed=%s rows\n" "${label}" \
                     "${n}" "$(python3 -c "import json;print(len(json.load(open('${WORK}/f.json'))['data']))")"
                 python3 - "${WORK}/o.json" "${WORK}/f.json" <<'PY'
 import json, sys
@@ -373,7 +389,7 @@ echo " Per-dataset results"
 echo "=============================================================="
 if [[ -s "${WORK}/table.tsv" ]]; then
     { printf 'SERVER\tDATASET\tNEO4J\tRESULT\n'; cat "${WORK}/table.tsv"; } \
-        | awk -F'\t' '{printf "  %-16s %-22s %-18s %s\n", $1, $2, $3, $4}'
+        | awk -F'\t' '{printf "  %-16s %-22s %-20s %s\n", $1, $2, $3, $4}'
 fi
 
 echo
@@ -387,21 +403,26 @@ echo "    can't: neo4j 3.5      : ${DS_NOSUB}"
 echo "    can't: other          : ${DS_OTHER}"
 echo
 echo "  comparisons run : ${TOTAL}"
-echo "  equivalent      : ${AGREE}"
-echo "  differing       : ${DISAGREE}"
-echo "  skipped         : ${SKIPPED}"
+echo "  equivalent      : ${C_GREEN}${AGREE}${C_RESET}"
+if [[ "${DISAGREE}" -gt 0 ]]; then
+    echo "  differing       : ${C_RED}${DISAGREE}${C_RESET}"
+else
+    echo "  differing       : ${C_GREEN}0${C_RESET}"
+fi
+echo "  skipped         : ${C_YELLOW}${SKIPPED}${C_RESET}"
 echo
 if [[ "${DISAGREE}" -gt 0 ]]; then
-    echo "  The two forms are NOT equivalent on real data. Do not propose the fix"
+    echo "  ${C_RED}The two forms are NOT equivalent on real data.${C_RESET} Do not propose the fix"
     echo "  until the difference above is understood."
     exit 1
 elif [[ "${AGREE}" -eq 0 ]]; then
-    echo "  Nothing was compared. Check that the token is valid -- every dataset"
+    echo "  ${C_YELLOW}Nothing was compared.${C_RESET} Check that the token is valid -- every dataset"
     echo "  was enumerated from /api/dbmeta/datasets, so the names are not the"
     echo "  problem."
     exit 1
 else
-    echo "  The fix returned the same rows as the original everywhere it could be"
-    echo "  compared. Note this only ever tests 4.4 servers: the original cannot"
-    echo "  run on 5.x or later to be compared against."
+    echo "  ${C_GREEN}The fix returned the same rows as the original everywhere${C_RESET}"
+    echo "  ${C_GREEN}it could be compared.${C_RESET}  Note this only ever tests 4.4"
+    echo "  servers: the original cannot run on 5.x or later to be compared"
+    echo "  against."
 fi
