@@ -42,6 +42,7 @@ sys.path line above is all a script needs.
 import os
 import re
 import sys
+from pathlib import Path
 
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
@@ -119,6 +120,47 @@ def want_color(choice=None, stream=None):
     return hasattr(stream, 'isatty') and stream.isatty()
 
 
+def load_baseline(path):
+    """Read a file of accepted-difference patterns.
+
+    One pattern per line; `#` comments and blank lines ignored. A pattern is
+    matched as a plain substring of the finding text, NOT a regex and not a
+    glob -- so a typo silently accepts nothing rather than silently accepting
+    everything, which is the failure direction that matters here.
+
+    Key on the stable part of a finding. Finding text looks like
+
+        endpoint / skeletons/skeleton: failed on neuprint-pre:wasp3:v0.0 only
+
+    and the tail names instances that change between runs, so the pattern to
+    write is the part before the colon:
+
+        endpoint / skeletons/skeleton
+
+    Returns a list of patterns, empty if path is None.
+    """
+    if not path:
+        return []
+    out = []
+    for line in Path(path).read_text().splitlines():
+        line = line.split('#', 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def add_baseline_argument(parser):
+    """Add the standard --baseline flag."""
+    parser.add_argument(
+        '--baseline', metavar='FILE',
+        help='a file of known, intended differences. Each line is matched as '
+             'a substring against the findings; anything matched is reported '
+             'as ACCEPTED rather than counted as a failure, so a difference '
+             'you have signed off stops drowning out new ones. Still listed '
+             'in the report -- accepted is not hidden.')
+    return parser
+
+
 def add_color_argument(parser):
     """Add the standard --color flag, so every tool spells it the same way."""
     parser.add_argument(
@@ -146,11 +188,14 @@ class Reporter:
     Color helps you scan; the roll-up means you do not have to.
     """
 
-    def __init__(self, style=None):
+    def __init__(self, style=None, baseline=None):
         self.lines = []
         self.findings = []          # (severity, text)
         self.fatals = []            # reasons the run could not complete
         self.s = style or Style(False)
+        # Differences already known and accepted -- see load_baseline().
+        self.baseline = baseline or []
+        self.accepted = []          # (text, the pattern that accepted it)
 
     def __call__(self, text=''):
         print(text)
@@ -160,7 +205,18 @@ class Reporter:
         self(f'\n{self.s.cyan(text)}')
 
     def diff(self, text):
-        """A real difference between the things being compared."""
+        """A real difference between the things being compared.
+
+        A difference matching the baseline is recorded as accepted instead:
+        still shown, still counted, but not a failure. Without this, a known
+        and intended difference prints as DIFF on every run and steadily
+        teaches the reader to skim the findings block -- which is the exact
+        habit that block exists to prevent.
+        """
+        for pattern in self.baseline:
+            if pattern in text:
+                self.accepted.append((text, pattern))
+                return
         self.findings.append(('DIFF', text))
 
     def warn(self, text):
@@ -186,12 +242,29 @@ class Reporter:
         mid-scroll. Returns (diffs, warnings)."""
         d, w = self.counts()
         if self.findings:
-            self(f'\n--- {title} ({d} difference(s), {w} warning(s)) ---')
+            extra = (f', {len(self.accepted)} accepted' if self.accepted else '')
+            self(f'\n--- {title} ({d} difference(s), {w} warning(s){extra}) ---')
             self(self.s.dim('  Everything flagged above, collected so a long '
                             'report cannot hide one.'))
             for sev, text in self.findings:
                 tag = self.s.red('DIFF') if sev == 'DIFF' else self.s.yellow('WARN')
                 self(f'  {tag}  {text}')
+            if d:
+                # Make accepting a difference a deliberate, copyable act
+                # rather than something you do by editing until it is quiet.
+                self(self.s.dim('\n  To accept one of these as intended, add '
+                                'a line to the baseline file:'))
+                for sev, text in self.findings:
+                    if sev == 'DIFF':
+                        self(self.s.dim(f'      {text.split(":")[0].strip()}'))
+
+        if self.accepted:
+            self(f'\n--- accepted differences ({len(self.accepted)}) ---')
+            self(self.s.dim('  Real differences, known and signed off. Listed '
+                            'so they stay visible, not hidden.'))
+            for text, pattern in self.accepted:
+                self(f'  {self.s.yellow("ACCEPTED")}  {text}')
+                self(self.s.dim(f'          matched baseline: {pattern}'))
         return d, w
 
     def print_fatals(self, title='could not complete'):

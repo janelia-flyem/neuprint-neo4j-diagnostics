@@ -1,0 +1,16 @@
+# Accepted differences for wasp3:v0.8 vs wasp3:v0.0 on neuprint-pre.
+#
+# Each line is matched as a plain substring against the finding text. Key on
+# the stable part -- the text before the colon -- since the tail names
+# instances that change between runs.
+#
+# Pass with --baseline. Anything matched is reported as ACCEPTED: still shown
+# in the report, but not counted as a failure. Accepting a difference is a
+# claim that you looked at it and it is intended, so say why.
+
+# Skeletons were never loaded for wasp3:v0.0, so /api/skeletons/skeleton
+# serves v0.8 and returns 400 "no store found" for v0.0. Confirmed intended
+# by RS, 2026-10-16. Note this endpoint is used by BOTH clients, so v0.0's
+# skeleton views are dead in neuPrintExplorer and neuprint-python alike --
+# accepted because the dataset is superseded, not because it does not matter.
+endpoint / skeletons/skeleton

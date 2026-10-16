@@ -16,11 +16,12 @@
 set -uo pipefail
 
 # Shared palette (COLOR=always|never|auto, NO_COLOR respected).
-. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "${HERE}/../common/colors.sh"
 S=${1:?usage: term-loss.sh <server> <dataset> [terms] [queries-dir]}
 DS=${2:?dataset required}
 TERMS=${3:-lc,a,dn,ps}
-Q=${4:-./queries}
+Q=${4:-${HERE}/queries}
 TOKEN=${NEUPRINT_JWT:-${NEUPRINT_TOKEN:-}}
 AUTH=(); [ -n "${TOKEN}" ] && AUTH=(-H "Authorization: Bearer ${TOKEN}")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT

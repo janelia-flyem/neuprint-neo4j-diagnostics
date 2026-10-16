@@ -25,11 +25,12 @@
 set -uo pipefail
 
 # Shared palette (COLOR=always|never|auto, NO_COLOR respected).
-. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "${HERE}/../common/colors.sh"
 
 S=${1:?usage: served-vs-complete.sh <server> [term] [queries-dir]}
 TERM=${2:-a}
-Q=${3:-./queries}
+Q=${3:-${HERE}/queries}
 TOKEN=${NEUPRINT_JWT:-${NEUPRINT_TOKEN:-}}
 AUTH=(); [ -n "${TOKEN}" ] && AUTH=(-H "Authorization: Bearer ${TOKEN}")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
