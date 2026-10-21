@@ -1,0 +1,67 @@
+# Accepted differences: yakuba-vnc (Neo4j 4.4.16) vs yakuba-vnc:v0.0 (2026.08.1)
+# on neuprint-yakuba, the parallel CalVer release.
+#
+# Each line is matched as a plain substring against the finding text. Accepting
+# a difference is a claim that you looked at it and it is intended -- so each
+# group below says why, and what would make it go away.
+#
+#   ./compare/compare-datasets.py neuprint-yakuba yakuba-vnc yakuba-vnc:v0.0 \
+#       --no-timing --baseline compare/baseline-yakuba.txt
+#
+# NOT in this file, deliberately: skeletons/skeleton and roimeshes/mesh, which
+# fail on v0.0 only. Those are a real misconfiguration -- config.json's dvidkv
+# entries declare "dataset": "yakuba-vnc" and so do not serve
+# "yakuba-vnc:v0.0". Fix the config rather than accepting the difference.
+
+# -------------------------------------------------------------------------
+# 1. Annotation drift. The two stores were built from the SAME segmentation
+#    UUID (7d0d1d848bb1, lastDatabaseEdit 2026-10-15 22:22:30) -- every
+#    structural count is exact, and the connectivity sample is identical
+#    edge for edge. But annotations are fetched live from DVID rather than
+#    pinned to that UUID, and these builds ran three hours apart:
+#        daily 4.4 build   2026-10-20T12:45:30
+#        manual v0.0 build 2026-10-20T09:40:50
+#    So a handful of bodies gained or changed annotations in between.
+#
+#    READ THIS BEFORE TRUSTING A CLEAN RUN: accepting these blinds the
+#    comparison to real annotation problems. The honest fix is to build both
+#    from the same annotation fetch, after which these entries should be
+#    deleted and any difference treated as a genuine finding.
+property / type
+property / class
+property / entryNerve
+property / exitNerve
+types / distinct types
+types / bodies with a type
+types / only in neuprint-yakuba
+types / types changed body count
+
+#    Downstream of the same drift: both endpoints return a list of types, so
+#    one differing type shifts every row after it. Row counts are equal
+#    (2769 and 3128); only the contents slide.
+endpoint / npexplorer/autapses
+endpoint / npexplorer/neuronmetavals
+
+# -------------------------------------------------------------------------
+# 2. Build metadata. /api/dbmeta/datasets reports a last-mod timestamp per
+#    dataset, which records when each build ran. Two builds, two timestamps.
+#    The ROI list in that response also arrives in a different order each
+#    call, because neuPrintHTTP builds it by ranging over a Go map -- that
+#    part is already absorbed, and only last-mod makes this differ.
+endpoint / dbmeta/datasets
+
+# -------------------------------------------------------------------------
+# 3. Known neuPrintHTTP defects, fixed in connectome-neuprint/neuPrintHTTP#96
+#    but not yet released -- the fleet runs 1.9.6, which still has them.
+#    Both are CalVer-only, which is why they show on v0.0 and not on 4.4:
+#      * cached/roiconnectivity returns an empty ROI list (32 bytes against
+#        42,380) because `CASE meta.overviewRois WHEN NULL` stopped matching
+#        on Neo4j 5+. yakuba sets no overviewRois, so it relies on that
+#        fallback.
+#      * cached/dailytype returns HTTP 400 because `exists(n.type)` was
+#        removed in Neo4j 5.
+#
+#    DELETE THESE TWO LINES once a neuPrintHTTP carrying #96 is deployed --
+#    they should start passing, and if they do not, that is worth knowing.
+endpoint / cached/roiconnectivity
+endpoint / cached/dailytype
