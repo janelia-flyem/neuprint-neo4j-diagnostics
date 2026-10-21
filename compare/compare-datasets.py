@@ -73,6 +73,7 @@ non-alphanumerics turned into underscores, e.g. NEUPRINT_JWT_NEUPRINT_PRE.
 Everything here is read-only.
 """
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -166,6 +167,17 @@ class Instance:
                 raw = r.read()
                 elapsed = time.perf_counter() - t0
                 ctype = r.headers.get('Content-Type', '')
+                cenc = r.headers.get('Content-Encoding', '')
+            # /api/cached/dailytype sets Content-Encoding: gzip and serves a
+            # gzipped body. urllib does not decompress, so without this the
+            # payload arrives as bytes starting 0x1f 0x8b and json.loads --
+            # or any attempt to read it -- fails with a decode error that
+            # looks like a server fault rather than our own.
+            if 'gzip' in cenc.lower():
+                try:
+                    raw = gzip.decompress(raw)
+                except OSError:
+                    pass            # not actually gzipped; use it as-is
             if 'json' in ctype:
                 return json.loads(raw), elapsed, None
             return raw, elapsed, None
@@ -527,7 +539,7 @@ def layer_data(a, b, rep):
         count = rep.s.red(str(len(items))) if items else rep.s.green('0')
         rep(f'  {title}: {count}')
         if items:
-            rep.diff(f'types / {len(items)} only in {side}')
+            rep.diff(f'types / only in {side}: {len(items)}')
         for t in items[:12]:
             rep(f'      {t}  ({src[t]} bodies)')
         if len(items) > 12:
@@ -535,7 +547,7 @@ def layer_data(a, b, rep):
     moved_n = rep.s.red(str(len(moved))) if moved else rep.s.green('0')
     rep(f'  body count changed: {moved_n}')
     if moved:
-        rep.diff(f'types / {len(moved)} types changed body count')
+        rep.diff(f'types / types changed body count: {len(moved)}')
     for t in moved[:12]:
         rep(f'      {t}  {da[t]} -> {db[t]}')
     if len(moved) > 12:
@@ -556,8 +568,16 @@ def layer_indexes(a, b, rep):
         rep.warn('indexes / SHOW INDEXES unavailable, inventory not compared')
         return True
 
+    # Neo4j renamed the ordinary index type between generations: 4.4 reports
+    # BTREE, 5+ and CalVer report RANGE. They are the same index. Comparing
+    # the raw type name makes every index look unique to one side on any
+    # 4.4-vs-CalVer comparison -- 128 phantom differences each way -- which is
+    # precisely the comparison this tool exists to make.
+    EQUIVALENT_TYPES = {'BTREE': 'RANGE'}
+
     def key(r):
-        return (str(r[1]), str(r[2]), str(r[4]))
+        idx_type = str(r[4]).upper()
+        return (str(r[1]), str(r[2]), EQUIVALENT_TYPES.get(idx_type, idx_type))
 
     ka = {key(r): r for r in (ia or [])}
     kb = {key(r): r for r in (ib or [])}
@@ -571,7 +591,7 @@ def layer_indexes(a, b, rep):
                                (f'only on {b.label}', only_b, b.label)):
         if items:
             rep(f'  {title}: {rep.s.red(str(len(items)))}')
-            rep.diff(f'indexes / {len(items)} only on {side}')
+            rep.diff(f'indexes / only on {side}: {len(items)}')
             for k in items[:10]:
                 rep(f'      {k[0]} {k[1]} ({k[2]})')
             if len(items) > 10:
@@ -579,7 +599,7 @@ def layer_indexes(a, b, rep):
     for lbl, items in ((a.label, not_online_a), (b.label, not_online_b)):
         if items:
             rep(rep.s.red(f'  NOT ONLINE on {lbl}: {len(items)} -- {items[:5]}'))
-            rep.diff(f'indexes / {len(items)} not ONLINE on {lbl}')
+            rep.diff(f'indexes / not ONLINE on {lbl}: {len(items)}')
     if not (only_a or only_b or not_online_a or not_online_b):
         rep(rep.s.green('  identical inventory, all ONLINE'))
     return not (only_a or only_b or not_online_a or not_online_b)

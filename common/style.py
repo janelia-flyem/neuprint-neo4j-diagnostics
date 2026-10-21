@@ -255,8 +255,15 @@ class Reporter:
                 self(self.s.dim('\n  To accept one of these as intended, add '
                                 'a line to the baseline file:'))
                 for sev, text in self.findings:
-                    if sev == 'DIFF':
-                        self(self.s.dim(f'      {text.split(":")[0].strip()}'))
+                    if sev != 'DIFF':
+                        continue
+                    # Split on ': ' (colon-SPACE), which is the separator
+                    # between a finding's key and its detail. Splitting on a
+                    # bare ':' truncates inside dataset names like
+                    # 'yakuba-vnc:v0.0', which collapsed two distinct
+                    # findings into one ambiguous key.
+                    key = text.split(': ', 1)[0].strip()
+                    self(self.s.dim(f'      {key}'))
 
         if self.accepted:
             self(f'\n--- accepted differences ({len(self.accepted)}) ---')
