@@ -331,7 +331,7 @@ def endpoint_catalog(inputs):
         # Registered in main.go rather than the api package, so it is easy to
         # miss when enumerating routes.  Drives the Neuroglancer layer setup.
         dict(name='npexplorer/nglayers', client='explorer', method='GET',
-             path=f'/api/npexplorer/nglayers/{ds}'),
+             path=f'/api/npexplorer/nglayers/{ds}', path_param=True),
     ]
 
     if inputs.get('roi'):
@@ -341,7 +341,8 @@ def endpoint_catalog(inputs):
             body={'dataset': ds, 'ROI': inputs['roi'], 'is_pre': True}))
         cat.append(dict(
             name='roimeshes/mesh', client='both', method='GET',
-            path=f'/api/roimeshes/mesh/{ds}/{urllib.parse.quote(inputs["roi"], safe="")}'))
+            path=f'/api/roimeshes/mesh/{ds}/{urllib.parse.quote(inputs["roi"], safe="")}',
+            path_param=True))
 
     if inputs.get('body_id') is not None:
         bid = inputs['body_id']
@@ -366,12 +367,12 @@ def endpoint_catalog(inputs):
                   **FILTER}))
         cat.append(dict(
             name='skeletons/skeleton', client='both', method='GET',
-            path=f'/api/skeletons/skeleton/{ds}/{bid}'))
+            path=f'/api/skeletons/skeleton/{ds}/{bid}', path_param=True))
 
     if inputs.get('cell_type'):
         t = urllib.parse.quote(inputs['cell_type'], safe='')
         cat.append(dict(name='npexplorer/celltype', client='explorer', method='GET',
-                        path=f'/api/npexplorer/celltype/{ds}/{t}'))
+                        path=f'/api/npexplorer/celltype/{ds}/{t}', path_param=True))
         cat.append(dict(
             name='npexplorer/findneurons', client='explorer', method='POST',
             path='/api/npexplorer/findneurons',
@@ -381,11 +382,19 @@ def endpoint_catalog(inputs):
     return cat
 
 
-def materialize(spec, inst):
-    """Substitute this instance's dataset into a spec."""
+def materialize(spec, inst, encode_dataset=False):
+    """Substitute this instance's dataset into a spec.
+
+    encode_dataset percent-encodes the name as a browser would when building
+    a URL path -- `yakuba-vnc:v0.0` becomes `yakuba-vnc%3Av0.0`. See
+    layer_path_encoding() for why that is worth testing separately.
+    """
+    name = (urllib.parse.quote(inst.dataset, safe='') if encode_dataset
+            else inst.dataset)
+
     def sub(v):
         if isinstance(v, str):
-            return v.replace('{dataset}', inst.dataset)
+            return v.replace('{dataset}', name)
         if isinstance(v, dict):
             return {k: sub(x) for k, x in v.items()}
         if isinstance(v, list):
@@ -394,9 +403,18 @@ def materialize(spec, inst):
     return sub(spec.get('path')), sub(spec.get('body')), sub(spec.get('query'))
 
 
-def call(spec, inst):
-    path, body, query = materialize(spec, inst)
+def call(spec, inst, encode_dataset=False):
+    path, body, query = materialize(spec, inst, encode_dataset)
     return inst.request(spec['method'], path, body=body, params=query)
+
+
+def needs_encoding(name):
+    """True when percent-encoding the name as a URL path segment changes it.
+
+    Only tagged dataset names do, since the tag separator is a colon:
+    'yakuba-vnc' is unchanged, 'yakuba-vnc:v0.0' becomes 'yakuba-vnc%3Av0.0'.
+    """
+    return urllib.parse.quote(name, safe='') != name
 
 
 # --------------------------------------------------------------------------
@@ -760,6 +778,55 @@ def layer_connectivity(a, b, sample, rep):
     return same
 
 
+def layer_path_encoding(a, b, catalog, rep):
+    """Do the path-parameter endpoints accept a correctly-encoded dataset name?
+
+    Four endpoints put the dataset in the URL PATH rather than a query string.
+    A browser building such a URL percent-encodes a colon, so a tagged dataset
+    arrives as `yakuba-vnc%3Av0.0`. neuPrintHTTP reads the parameter with
+    c.Param("dataset") and does not url.PathUnescape it, so the encoded form
+    is treated as a literal dataset name that does not exist.
+
+    Measured on neuprint-yakuba, 2026-10-21:
+        /api/roimeshes/mesh/yakuba-vnc:v0.0/ANm     -> 200, 2,555,002 bytes
+        /api/roimeshes/mesh/yakuba-vnc%3Av0.0/ANm   -> 400
+
+    This is NOT a comparison between the two instances -- it is a property of
+    each deployment -- but it belongs here because this is the tool that knows
+    which endpoints take the dataset in the path. The rest of this tool sends
+    the raw form, so without this check it reports those endpoints healthy
+    while they are broken for any client that encodes correctly.
+
+    Silent for untagged dataset names, where encoding changes nothing.
+    """
+    targets = [s for s in catalog if s.get('path_param')]
+    instances = [i for i in (a, b) if needs_encoding(i.dataset)]
+    if not targets or not instances:
+        return
+    rep.heading('--- dataset name in the URL path: raw vs encoded ---')
+    rep(rep.s.dim('  A browser percent-encodes the colon in a tagged dataset '
+                  'name. These endpoints'))
+    rep(rep.s.dim('  take the dataset in the path, so both forms should '
+                  'behave identically.'))
+    for inst in instances:
+        encoded = urllib.parse.quote(inst.dataset, safe='')
+        rep(f'\n  {inst.label}   {inst.dataset} -> {encoded}')
+        for spec in targets:
+            _, _, raw_err = call(spec, inst)
+            _, _, enc_err = call(spec, inst, encode_dataset=True)
+            raw_s = raw_err.split(':')[0] if raw_err else 'ok'
+            enc_s = enc_err.split(':')[0] if enc_err else 'ok'
+            if raw_s == enc_s:
+                rep(f'    {spec["name"]:<28} raw {raw_s:<10} '
+                    f'encoded {enc_s:<10} {rep.s.green("same")}')
+            else:
+                rep(f'    {spec["name"]:<28} raw {raw_s:<10} '
+                    f'encoded {enc_s:<10} {rep.s.yellow("DIFFERS")}')
+                rep.warn(f'encoding / {spec["name"]} on {inst.label}: raw '
+                         f'{raw_s}, encoded {enc_s} -- breaks clients that '
+                         f'encode the path correctly')
+
+
 def layer_endpoints(a, b, catalog, rep):
     """Call every endpoint on both and compare the responses."""
     rep('\n--- function: endpoint responses ---')
@@ -1108,6 +1175,8 @@ def main(argv):
         catalog = endpoint_catalog(inputs)
     if not args.no_endpoints:
         endpoints_same, _ = layer_endpoints(a, b, catalog, rep)
+        # Only runs when a dataset name actually needs encoding.
+        layer_path_encoding(a, b, catalog, rep)
     if not args.no_timing:
         layer_timing(a, b, catalog, args.reps, args.tolerance, rep)
 
