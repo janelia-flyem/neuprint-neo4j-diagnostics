@@ -111,7 +111,8 @@ servers or two datasets on one server.
 Five layers: `:Meta` provenance and node counts; a **connectivity sample** that
 compares edges and weights for bodies present on both, because matching counts
 prove nothing about which bodies are joined to which; the index inventory;
-server configuration; and up to **19 read-only endpoint responses**.
+server configuration; and **19 read-only endpoints**, 23 responses at the
+default `--samples 3`.
 
 ```bash
 ./compare/compare-datasets.py neuprint-pre:yakuba neuprint-test   # two servers
@@ -126,7 +127,7 @@ endpoint, so a difference can be traced to the thing that will actually break:
 endpoint                       cl           A          B  verdict
 dbmeta/datasets                EP      57297B     57297B  identical
 cached/roiconnectivity         E          32B        32B  identical, but EMPTY on both
-skeletons/skeleton             EP       4227B        ERR  ERROR
+skeletons/skeleton[11005]      EP       4227B        ERR  ERROR
 ```
 
 `E` is neuPrintExplorer only, `P` is neuprint-python only, `EP` is both. The
@@ -146,6 +147,14 @@ the end, so a long report cannot hide one. Three things it is careful about:
   sides means it is unconfigured, not that the two disagree.
 - **Internal ids are excluded.** `id(n)` is assigned from import order, so two
   separately built databases always disagree on `m_id`/`n_id`/`pre_id`.
+
+Meshes and skeletons are checked against **`--samples` keys each** (default 3),
+and named for the key they used — `roimeshes/mesh[ANm]`. Every other endpoint
+runs the same query whatever input it is handed, so one input settles it. These
+two read a per-key store, where one ROI and one body prove only that those are
+served; yakuba v0.0 had a store wired to one dataset and silent for the other,
+and a single sample is a thin way to catch that. The timing and path-encoding
+layers still use one key per route, since neither question is about the key.
 
 Timing is reported — A/B interleaved, first repetition discarded, median not
 mean — but never changes the verdict. A timing comparison between two machines
@@ -317,10 +326,10 @@ reading the other seventeen:
   dbmeta/datasets                EP      57297B     57297B  identical            <- green
   cached/roiconnectivity         E          32B        32B  identical, but EMPTY on both   <- yellow
   npexplorer/completeness        E        3927B      3927B  identical            <- green
-  skeletons/skeleton             EP       4227B        ERR  ERROR                <- red
+  skeletons/skeleton[11005]      EP       4227B        ERR  ERROR                <- red
 
   --- findings (1 difference(s), 9 warning(s)) ---
-    DIFF  endpoint / skeletons/skeleton: failed on wasp3:v0.0 only   <- DIFF in red
+    DIFF  endpoint / skeletons/skeleton[11005]: failed on wasp3:v0.0 only   <- DIFF in red
     WARN  endpoint / cached/roiconnectivity: both sides returned an empty response
 ```
 

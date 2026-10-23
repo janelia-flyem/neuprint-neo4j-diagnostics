@@ -130,12 +130,17 @@ def load_baseline(path):
 
     Key on the stable part of a finding. Finding text looks like
 
-        endpoint / skeletons/skeleton: failed on neuprint-pre:wasp3:v0.0 only
+        endpoint / skeletons/skeleton[11005]: failed on neuprint-pre:wasp3:v0.0 only
 
     and the tail names instances that change between runs, so the pattern to
     write is the part before the colon:
 
-        endpoint / skeletons/skeleton
+        endpoint / skeletons/skeleton[11005]
+
+    Shortening a pattern widens it, which is occasionally what you want: the
+    `[11005]` is one sampled body of several, and dropping it accepts the
+    endpoint for every body rather than that one. Drop it deliberately, not
+    by habit.
 
     Returns a list of patterns, empty if path is None.
     """
