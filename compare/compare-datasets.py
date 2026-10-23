@@ -339,9 +339,15 @@ def endpoint_catalog(inputs):
             name='npexplorer/distribution', client='explorer', method='POST',
             path='/api/npexplorer/distribution',
             body={'dataset': ds, 'ROI': inputs['roi'], 'is_pre': True}))
+
+    # One spec per sampled ROI.  The ROI goes in the endpoint name so a
+    # failure says which one, and so the baseline can accept a single ROI
+    # without accepting the endpoint; `endpoint / roimeshes/mesh` still
+    # matches every one of them as a substring, deliberately.
+    for roi in inputs.get('rois', []):
         cat.append(dict(
-            name='roimeshes/mesh', client='both', method='GET',
-            path=f'/api/roimeshes/mesh/{ds}/{urllib.parse.quote(inputs["roi"], safe="")}',
+            name=f'roimeshes/mesh[{roi}]', client='both', method='GET',
+            path=f'/api/roimeshes/mesh/{ds}/{urllib.parse.quote(roi, safe="")}',
             path_param=True))
 
     if inputs.get('body_id') is not None:
@@ -365,9 +371,11 @@ def endpoint_catalog(inputs):
             path='/api/npexplorer/commonconnectivity',
             body={'dataset': ds, 'neuron_ids': [bid], 'find_inputs': False,
                   **FILTER}))
+
+    for body in inputs.get('body_ids', []):
         cat.append(dict(
-            name='skeletons/skeleton', client='both', method='GET',
-            path=f'/api/skeletons/skeleton/{ds}/{bid}', path_param=True))
+            name=f'skeletons/skeleton[{body}]', client='both', method='GET',
+            path=f'/api/skeletons/skeleton/{ds}/{body}', path_param=True))
 
     if inputs.get('cell_type'):
         t = urllib.parse.quote(inputs['cell_type'], safe='')
@@ -380,6 +388,25 @@ def endpoint_catalog(inputs):
                   'input_ROIs': [], 'output_ROIs': [], **FILTER}))
 
     return cat
+
+
+def one_per_route(specs):
+    """Keep the first spec of each route, dropping the extra sampled keys.
+
+    --samples fans roimeshes/mesh and skeletons/skeleton out over several
+    ROIs and bodies, named `route[key]`. That is right for the response
+    comparison, which is asking whether each key is served. It is waste
+    anywhere the question is about the route itself -- latency, or whether
+    the server decodes the dataset in the path -- where the extra keys buy
+    nothing and meshes cost megabytes apiece.
+    """
+    out, seen = [], set()
+    for s in specs:
+        route = s['name'].split('[', 1)[0]
+        if route not in seen:
+            seen.add(route)
+            out.append(s)
+    return out
 
 
 def materialize(spec, inst, encode_dataset=False):
@@ -421,9 +448,17 @@ def needs_encoding(name):
 # choosing deterministic inputs present on both sides
 # --------------------------------------------------------------------------
 
-def choose_inputs(a, b, rep):
+def choose_inputs(a, b, rep, samples=1):
     """Pick a cell type, bodyId and ROI that exist on BOTH instances, so a
-    difference in a response is never just a difference in the input."""
+    difference in a response is never just a difference in the input.
+
+    Most endpoints take one input and one is enough: they run the same query
+    whatever you pass. Meshes and skeletons do not -- each ROI and each body
+    is a separate key in a separate dvidkv store, so one of each proves only
+    that one of each is served. That is the failure this missed on yakuba
+    v0.0, where a store answered for the dataset it was wired to and silently
+    for nothing else. So those two collect `samples` values rather than one.
+    """
     inputs = {}
 
     types_a, _ = a.cypher(
@@ -438,12 +473,16 @@ def choose_inputs(a, b, rep):
         inputs['cell_type'] = common_types[0]
 
     q_body = ('MATCH (n:Neuron) WHERE n.type IS NOT NULL '
-              'RETURN n.bodyId ORDER BY n.bodyId LIMIT 1')
-    ba, bb = a.scalar(q_body), b.scalar(q_body)
-    if ba is not None and ba == bb:
-        inputs['body_id'] = ba
-    elif ba is not None and bb is not None:
-        # Fall back to the lowest bodyId the two have in common.
+              f'RETURN n.bodyId ORDER BY n.bodyId LIMIT {int(samples)}')
+    rows_a, _ = a.cypher(q_body)
+    rows_b, _ = b.cypher(q_body)
+    bodies_a = [r[0] for r in (rows_a or [])]
+    bodies_b = [r[0] for r in (rows_b or [])]
+    if bodies_a and bodies_a == bodies_b:
+        inputs['body_ids'] = bodies_a
+    elif bodies_a and bodies_b:
+        # The two disagree on the lowest few, so fall back to a wider scan
+        # and take the lowest the two have in common.
         rows_a, _ = a.cypher('MATCH (n:Neuron) RETURN n.bodyId '
                              'ORDER BY n.bodyId LIMIT 5000')
         rows_b, _ = b.cypher('MATCH (n:Neuron) RETURN n.bodyId '
@@ -451,17 +490,25 @@ def choose_inputs(a, b, rep):
         common = sorted({r[0] for r in (rows_a or [])}
                         & {r[0] for r in (rows_b or [])})
         if common:
-            inputs['body_id'] = common[0]
+            inputs['body_ids'] = common[:samples]
+    if inputs.get('body_ids'):
+        inputs['body_id'] = inputs['body_ids'][0]
 
     rois_a = a.scalar("MATCH (m:Meta) RETURN m.primaryRois") or []
     rois_b = b.scalar("MATCH (m:Meta) RETURN m.primaryRois") or []
     common_rois = sorted(set(rois_a) & set(rois_b))
     if common_rois:
         inputs['roi'] = common_rois[0]
+        inputs['rois'] = common_rois[:samples]
 
     rep('  inputs chosen (present on both):')
     for k in ('cell_type', 'body_id', 'roi'):
         rep(f'    {k:<10} {inputs.get(k, "-- none in common --")}')
+    for k in ('rois', 'body_ids'):
+        extra = inputs.get(k, [])[1:]
+        if extra:
+            rep(rep.s.dim(f'    {k:<10} also sampled for meshes/skeletons: '
+                          f'{", ".join(str(v) for v in extra)}'))
     return inputs
 
 
@@ -841,7 +888,10 @@ def layer_path_encoding(a, b, catalog, rep):
 
     Silent for untagged dataset names, where encoding changes nothing.
     """
-    targets = [s for s in catalog if s.get('path_param')]
+    # Whether the server decodes the dataset in a path is a property of the
+    # route, not of the key after it, so one spec per route is the whole
+    # answer -- and meshes run to megabytes, fetched twice each here.
+    targets = one_per_route(s for s in catalog if s.get('path_param'))
     instances = [i for i in (a, b) if needs_encoding(i.dataset)]
     if not targets or not instances:
         return
@@ -1112,7 +1162,7 @@ def layer_timing(a, b, catalog, reps, tolerance, rep):
     rep(f'\n--- timing ({reps} reps, first discarded, median reported) ---')
     rep(f'  {"endpoint":<30} {"A med":>9} {"B med":>9} {"B/A":>7}')
     flagged = []
-    for spec in catalog:
+    for spec in one_per_route(catalog):
         ta, tb = [], []
         failed = False
         for _ in range(reps):
@@ -1188,7 +1238,16 @@ def main(argv):
     p.add_argument('--no-connectivity', action='store_true')
     p.add_argument('--sample', type=int, default=25, metavar='N',
                    help='bodies to sample for the connectivity comparison '
-                        '(default 25; chosen from bodyIds present on both)')
+                        '(default 25; chosen from bodyIds present on both). '
+                        'Not --samples, below.')
+    p.add_argument('--samples', type=int, default=3, metavar='N',
+                   help='how many ROIs and bodies to fetch meshes and '
+                        'skeletons for (default 3). Every other endpoint '
+                        'runs one query whatever input you give it, but '
+                        'these two read a per-key store, so one ROI and one '
+                        'body prove only that those are served. Raise it to '
+                        'widen that check; 1 restores the old behavior. '
+                        'Not --sample, above.')
     p.add_argument('--no-report', action='store_true',
                    help='do not write results/<a>-vs-<b>-<stamp>.txt')
     add_color_argument(p)
@@ -1239,7 +1298,7 @@ def main(argv):
     endpoints_same = True
     if not args.no_endpoints or not args.no_timing:
         rep('\n--- choosing comparison inputs ---')
-        inputs = choose_inputs(a, b, rep)
+        inputs = choose_inputs(a, b, rep, samples=max(1, args.samples))
         catalog = endpoint_catalog(inputs)
     if not args.no_endpoints:
         endpoints_same, _ = layer_endpoints(a, b, catalog, rep)

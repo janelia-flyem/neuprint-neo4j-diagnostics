@@ -13,4 +13,8 @@
 # by RS, 2026-10-16. Note this endpoint is used by BOTH clients, so v0.0's
 # skeleton views are dead in neuPrintExplorer and neuprint-python alike --
 # accepted because the dataset is superseded, not because it does not matter.
+#
+# --samples checks several bodies, each named `skeletons/skeleton[<bodyId>]`.
+# This pattern stops short of the bracket on purpose: no body has a skeleton
+# here, so accepting the route is the honest shape of the claim.
 endpoint / skeletons/skeleton

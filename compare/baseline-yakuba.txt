@@ -8,10 +8,20 @@
 #   ./compare/compare-datasets.py neuprint-yakuba yakuba-vnc yakuba-vnc:v0.0 \
 #       --no-timing --baseline compare/baseline-yakuba.txt
 #
-# NOT in this file, deliberately: skeletons/skeleton and roimeshes/mesh, which
-# fail on v0.0 only. Those are a real misconfiguration -- config.json's dvidkv
-# entries declare "dataset": "yakuba-vnc" and so do not serve
-# "yakuba-vnc:v0.0". Fix the config rather than accepting the difference.
+# EVERY ENTRY HERE ASSUMES BOTH STORES SHARE A Meta.uuid -- that they are two
+# builds of the SAME segmentation, differing only in build time and pipeline.
+# When the uuid differs the segmentation itself has moved: bodies merge and
+# split, counts change, connectivity changes, and these entries would absorb
+# all of it as though it were drift. compare-datasets.py enforces this and
+# ignores the whole file on a uuid mismatch, but the assumption is the reason
+# every line below exists, so keep it in mind when adding one.
+#
+# NOT in this file, deliberately: skeletons/skeleton and roimeshes/mesh. They
+# failed on v0.0 only until 2026-10-21, because config.json's dvidkv entries
+# declared "dataset": "yakuba-vnc" and so did not serve "yakuba-vnc:v0.0".
+# That was fixed by adding a second store per datatype with its own unique
+# "instance" name -- the right answer was to fix the config, not to accept the
+# difference. Both now report identical.
 
 # -------------------------------------------------------------------------
 # 1. Annotation drift. The two stores were built from the SAME segmentation
