@@ -480,6 +480,48 @@ def row(rep, label, va, vb, note='', cat='data'):
     return same
 
 
+def check_baseline_applies(a, b, rep):
+    """Drop the baseline when the two stores are not the same source data.
+
+    A baseline encodes a judgment -- "these differences are expected between
+    these two things" -- and that judgment rests on an assumption the file
+    cannot state for itself: that both stores were built from the same
+    segmentation, and so differ only in build time and pipeline.
+
+    When Meta.uuid differs, the segmentation itself has moved. Bodies merge
+    and split, counts change, connectivity changes, and entries written for
+    annotation drift start silently absorbing real divergence. Observed on
+    yakuba 2026-10-23: the nightly 4.4 build advanced a week to a new uuid
+    while the frozen CalVer store did not, and the baseline went on accepting
+    "45 types changed body count" as though nothing had happened.
+
+    So a mismatch disables the baseline rather than warning about it: a run
+    that cannot be trusted should not be able to report OK.
+    """
+    if not rep.baseline:
+        return
+    ua = a.scalar('MATCH (m:Meta) RETURN m.uuid')
+    ub = b.scalar('MATCH (m:Meta) RETURN m.uuid')
+    if not ua or not ub or ua == ub:
+        return
+    rep.heading('--- baseline IGNORED ---')
+    rep(f'  {rep.s.red("Meta.uuid differs")}: {str(ua)[:12]}... vs '
+        f'{str(ub)[:12]}...')
+    rep('  A baseline says which differences are expected between two builds '
+        'of the SAME')
+    rep('  segmentation. These are different segmentations, so its entries '
+        'would absorb')
+    rep('  real divergence -- bodies merged or split, connectivity changed '
+        '-- as though')
+    rep('  it were build-time drift. All '
+        f'{len(rep.baseline)} entries are ignored for this run.')
+    rep(rep.s.dim('  To compare these meaningfully, rebuild one store from '
+                  'the other\'s uuid.'))
+    rep.baseline = []
+    rep.warn('baseline ignored: the two stores have different Meta.uuid, so '
+             'accepted differences would hide real ones')
+
+
 def layer_identity(a, b, rep):
     """Server and Neo4j versions.  These are EXPECTED to differ during a
     parallel release, so they are reported and never counted as failures."""
@@ -1002,6 +1044,22 @@ def pick_dataset_entry(payload, dataset):
     return payload
 
 
+def abridge(value, width=48):
+    """A short, readable stand-in for a value in a difference line.
+
+    Collections report their size rather than their contents: a Cypher
+    `collect(...)` column can hold thousands of entries, and the useful fact
+    is usually that it changed and by how much, not every element. The full
+    payload is in the saved report's byte counts and digests if needed.
+    """
+    if isinstance(value, (list, tuple)):
+        return f'<{len(value)} items>'
+    if isinstance(value, dict):
+        return f'<{len(value)} keys>'
+    s = str(value)
+    return s if len(s) <= width else s[:width - 3] + '...'
+
+
 def describe_difference(pa, pb, rep, limit=4):
     ra, rb = rows_of(pa), rows_of(pb)
     if ra is not None and rb is not None:
@@ -1017,8 +1075,14 @@ def describe_difference(pa, pb, rep, limit=4):
                 moved = [(cols[j] if j < len(cols) else f'col{j}', u, v)
                          for j, (u, v) in enumerate(zip(x, y))
                          if canon(u) != canon(v)]
-                rep(f'      row {i}: ' + ', '.join(
-                    f'{c}: {u} -> {v}' for c, u, v in moved[:6]))
+                # Truncate every value. A "column" is not always a scalar:
+                # commonconnectivity returns a single collect(...) column
+                # holding thousands of entries, and printing it whole buries
+                # the report in one row.
+                line = ', '.join(f'{c}: {abridge(u)} -> {abridge(v)}'
+                                 for c, u, v in moved[:6])
+                rep(f'      row {i}: {line[:220]}'
+                    + (' ...' if len(line) > 220 else ''))
             else:
                 rep(f'      row {i} A: {str(x)[:90]}')
                 rep(f'      row {i} B: {str(y)[:90]}')
@@ -1148,6 +1212,10 @@ def main(argv):
     rep(f'compare-datasets  {started.strftime("%Y-%m-%d %H:%M:%SZ")}')
     rep(f'  A  {a.server}  dataset {a.dataset}')
     rep(f'  B  {b.server}  dataset {b.dataset}')
+
+    # Before anything is compared: a baseline is only meaningful when
+    # both stores come from the same segmentation.
+    check_baseline_applies(a, b, rep)
 
     layer_identity(a, b, rep)
 
