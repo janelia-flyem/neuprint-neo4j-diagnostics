@@ -17,6 +17,19 @@ The original two-datasets-on-one-server form still works:
 
     ./compare-datasets.py neuprint-pre wasp3:v0.8 wasp3:v0.0
 
+Either side may instead be a SNAPSHOT DIRECTORY -- the conf/ data/ logs/
+plugins/ tree flyem-snapshot writes, before anyone copies it to a server:
+
+    ./compare-datasets.py /groups/.../wasp3-v0.0/neo4j neuprint-pre:wasp3:v1.0
+
+neo4j is started on that directory in a container, queried, and stopped
+again.  The point is to run the comparison BEFORE the copy: a count
+discrepancy found now costs a re-export, found afterwards it costs the
+transfer as well.  The data, connectivity, index and config layers ask
+Cypher questions and work unchanged; the endpoint, timing and path-encoding
+layers need neuPrintHTTP and are skipped, since nothing is serving the
+directory.  Needs apptainer, so run it where the snapshot lives.
+
 What it compares, in three layers:
 
   DATA      :Meta provenance, node counts per label, how many Neurons carry
@@ -73,14 +86,19 @@ non-alphanumerics turned into underscores, e.g. NEUPRINT_JWT_NEUPRINT_PRE.
 Everything here is read-only.
 """
 import argparse
+import atexit
 import gzip
 import hashlib
 import json
 import os
 import re
+import shutil
+import socket
 import ssl
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -140,6 +158,8 @@ def token_for(server):
 
 class Instance:
     """One (server, dataset) pair, with its own credentials."""
+
+    is_snapshot = False
 
     def __init__(self, server, dataset):
         self.server = normalize_server(server)
@@ -202,6 +222,324 @@ class Instance:
         if err or not rows:
             return default
         return rows[0][0]
+
+
+
+# --------------------------------------------------------------------------
+# the snapshot backend
+# --------------------------------------------------------------------------
+#
+# A snapshot is a built-but-not-yet-deployed database: the conf/ data/ logs/
+# plugins/ directory flyem-snapshot writes, before anyone copies it to a
+# server.  Nothing serves it, so none of the HTTP layers apply -- but the
+# data, connectivity, index and config layers only ever ask Cypher
+# questions, and those can be answered by starting neo4j on the directory.
+#
+# That makes the expensive half of this comparison runnable BEFORE the copy
+# rather than after it, which is the point: a count discrepancy found now
+# costs a re-export, found later it costs the transfer too.
+
+SNAPSHOT_IMAGE = 'docker://neo4j:2026.08.1'
+SNAPSHOT_START_TIMEOUT = 900
+
+# Runs inside the container.  Quoted heredoc on the Python side too: nothing
+# here is substituted by the host.
+BOOT_SH = r'''#!/bin/bash
+# Started by compare-datasets.py.  Runs neo4j in the FOREGROUND so the host
+# has one process handle governing the server's lifetime -- `neo4j start`
+# daemonizes and leaves nothing to wait on or terminate.
+set -uo pipefail
+
+cp /conf/neo4j.conf "${NEO4J_HOME}/conf/neo4j.conf"
+ls /plugins/* > /dev/null 2>&1 && cp /plugins/* "${NEO4J_HOME}/plugins/"
+CONF="${NEO4J_HOME}/conf/neo4j.conf"
+
+# The snapshot's conf is sized for the machine that built it -- the stock
+# template asks for a 31G heap and a 150G page cache.  A smaller host will
+# refuse to start, so both are overridable.
+if [[ -n "${HEAP_SIZE:-}" ]]; then
+    sed -i -e "s|^server\.memory\.heap\.initial_size=.*|server.memory.heap.initial_size=${HEAP_SIZE}|" \
+           -e "s|^server\.memory\.heap\.max_size=.*|server.memory.heap.max_size=${HEAP_SIZE}|" "${CONF}"
+fi
+if [[ -n "${PAGECACHE:-}" ]]; then
+    sed -i -e "s|^server\.memory\.pagecache\.size=.*|server.memory.pagecache.size=${PAGECACHE}|" "${CONF}"
+fi
+
+# Listen on ports the host picked and confirmed free, loopback only.
+# apptainer shares the host's network namespace, so the stock 7474/7687 would
+# collide with anything already listening -- a production neo4j on the same
+# node, or a second run of this tool.
+sed -i -e '/^server\.http\.listen_address=/d' \
+       -e '/^server\.bolt\.listen_address=/d' \
+       -e '/^server\.https\.listen_address=/d' "${CONF}"
+{
+    echo "server.http.listen_address=127.0.0.1:${HTTP_PORT}"
+    echo "server.bolt.listen_address=127.0.0.1:${BOLT_PORT}"
+} >> "${CONF}"
+
+# This log lives in the snapshot directory and PERSISTS between runs, so a
+# stale startup line from an earlier run would satisfy the host's wait while
+# this start was still failing.  Truncate first.
+: > /logs/neo4j.log
+
+exec neo4j console
+'''
+
+
+def free_port():
+    """A port nothing is listening on, as of now.
+
+    Racy in principle -- something could take it between this call and neo4j
+    binding it -- but the alternative is the fixed 7474/7687, which on a
+    neuprint host is very likely already taken by the thing being compared
+    against.
+    """
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+class SnapshotInstance:
+    """One side of the comparison, backed by a snapshot directory rather than
+    a running server.
+
+    Presents the same surface the layers use -- cypher(), scalar(), label,
+    dataset -- so nothing above has to know which kind of side it has.
+    request() is the exception: it is how the endpoint layers reach
+    neuPrintHTTP, and there is no neuPrintHTTP here.  It returns an error
+    saying so rather than raising, in case a caller reaches it anyway.
+    """
+
+    is_snapshot = True
+
+    def __init__(self, path, image=None, heap=None, pagecache=None, db='data'):
+        self.path = Path(path).expanduser().resolve()
+        self.image = image or os.environ.get('NEO4J_IMAGE') or SNAPSHOT_IMAGE
+        self.heap = heap
+        self.pagecache = pagecache
+        self.db = db
+        self.server = f'snapshot {self.path}'
+        self.label = f'snapshot:{self.path.parent.name}'
+        self.dataset = self.path.parent.name
+        self.token = None               # nothing to authenticate to
+        self.proc = None
+        self.work = None
+        self.http_port = None
+        self.bolt_port = None
+        self._endpoint = None           # whichever query API answered first
+
+    # -- lifecycle --------------------------------------------------------
+
+    def check_layout(self):
+        """Fail before starting a container rather than inside one."""
+        if not self.path.is_dir():
+            return f'no such directory: {self.path}'
+        missing = [d for d in ('conf', 'data', 'logs', 'plugins')
+                   if not (self.path / d).is_dir()]
+        if missing:
+            return (f'{self.path} is not a neo4j export directory -- missing '
+                    f'{", ".join(missing)}/')
+        if not (self.path / 'conf' / 'neo4j.conf').is_file():
+            return f'{self.path}/conf/neo4j.conf does not exist'
+        # Two apoc jars break startup with a classloading error that never
+        # mentions plugins, so name the real problem here.
+        jars = sorted((self.path / 'plugins').glob('apoc-*.jar'))
+        if len(jars) > 1:
+            return (f'{len(jars)} apoc jars in {self.path}/plugins -- only one '
+                    f'may be present: {", ".join(j.name for j in jars)}')
+        if shutil.which('apptainer') is None:
+            return ('apptainer is not on PATH. A snapshot side needs it to '
+                    'start neo4j on the directory; run this where the '
+                    'snapshot lives.')
+        return None
+
+    def start(self, rep):
+        """Start neo4j on the snapshot.  Returns True once it answers."""
+        problem = self.check_layout()
+        if problem:
+            rep.fatal(f'{self.label}: {problem}')
+            return False
+
+        self.http_port, self.bolt_port = free_port(), free_port()
+        self.work = Path(tempfile.mkdtemp(prefix='compare-snapshot-'))
+        boot = self.work / 'boot.sh'
+        boot.write_text(BOOT_SH)
+        boot.chmod(0o755)
+        self.console_log = self.work / 'console.log'
+
+        env = os.environ.copy()
+        env['APPTAINER_BIND'] = ','.join([
+            f'{self.path}/conf:/conf',
+            f'{self.path}/data:/data',
+            f'{self.path}/logs:/logs',
+            f'{self.path}/plugins:/plugins',
+            f'{self.work}:/boot',
+        ])
+        env['APPTAINERENV_HTTP_PORT'] = str(self.http_port)
+        env['APPTAINERENV_BOLT_PORT'] = str(self.bolt_port)
+        env['APPTAINERENV_HEAP_SIZE'] = self.heap or ''
+        env['APPTAINERENV_PAGECACHE'] = self.pagecache or ''
+        # cypher-shell is not used here, but neo4j itself sizes its GC and
+        # Netty pools from availableProcessors(); on a 128-core node that is
+        # hundreds of threads it has no use for.
+        env['APPTAINERENV_JAVA_OPTS'] = (
+            os.environ.get('JAVA_OPTS', '') + ' -XX:ActiveProcessorCount=4').strip()
+
+        rep(f'  starting neo4j on {self.path}')
+        rep(rep.s.dim(f'    image {self.image}, database {self.db}, '
+                      f'http port {self.http_port}'))
+        with open(self.console_log, 'wb') as out:
+            self.proc = subprocess.Popen(
+                ['apptainer', 'exec', '--writable-tmpfs', self.image,
+                 'bash', '/boot/boot.sh'],
+                stdout=out, stderr=subprocess.STDOUT, env=env,
+                stdin=subprocess.DEVNULL)
+
+        deadline = time.time() + SNAPSHOT_START_TIMEOUT
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                rep.fatal(f'{self.label}: neo4j exited during startup '
+                          f'(status {self.proc.returncode})')
+                self._report_log(rep)
+                return False
+            rows, err = self.cypher('RETURN 1')
+            if not err and rows:
+                break
+            time.sleep(2)
+        else:
+            rep.fatal(f'{self.label}: neo4j did not answer within '
+                      f'{SNAPSHOT_START_TIMEOUT}s')
+            self._report_log(rep)
+            self.stop()
+            return False
+
+        # Name this side the way neuPrintHTTP would serve it, so the report
+        # reads against the other side rather than against a directory path.
+        # This is also the first place a missing Meta.tag shows up: the
+        # snapshot checker never reads it, and an empty one is what makes a
+        # parallel release collide.
+        ds = self.scalar('MATCH (m:Meta) RETURN m.dataset')
+        tag = self.scalar('MATCH (m:Meta) RETURN m.tag')
+        if ds:
+            self.dataset = f'{ds}:{tag}' if tag else ds
+            self.label = f'snapshot:{self.dataset}'
+        rep(f'  {rep.s.green("ready")} -- serves as '
+            f'{self.dataset}'
+            + ('' if tag else rep.s.yellow('   <-- no Meta.tag')))
+        return True
+
+    def _report_log(self, rep):
+        tail = ''
+        for candidate in (self.path / 'logs' / 'neo4j.log', self.console_log):
+            try:
+                tail = candidate.read_text(errors='replace')[-1500:]
+            except OSError:
+                continue
+            if tail.strip():
+                rep(rep.s.dim(f'    --- {candidate} (tail) ---'))
+                for line in tail.strip().splitlines()[-15:]:
+                    rep(rep.s.dim(f'    {line}'))
+                break
+        if 'OutOfMemoryError' in tail or 'heap' in tail.lower():
+            rep(rep.s.yellow('    The snapshot conf asks for a 31G heap and a '
+                             '150G page cache by default.'))
+            rep(rep.s.yellow('    Try --snapshot-heap 8G --snapshot-pagecache 8G.'))
+
+    def stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=30)
+        self.proc = None
+        if self.work is not None:
+            shutil.rmtree(self.work, ignore_errors=True)
+            self.work = None
+
+    # -- querying ---------------------------------------------------------
+
+    def _post(self, path, body):
+        """Returns (payload, http_status, transport_error).
+
+        The status is kept apart from the payload because neo4j answers a
+        rejected query with a status too: a 400 carrying {"errors": [...]}
+        is a Cypher problem, while a 404 means this server has no such
+        endpoint.  Collapsing the two would make a missing query API look
+        like a syntax error and defeat the fallback below.
+        """
+        url = f'http://127.0.0.1:{self.http_port}{path}'
+        req = urllib.request.Request(url, method='POST',
+                                     data=json.dumps(body).encode())
+        req.add_header('Content-Type', 'application/json')
+        req.add_header('Accept', 'application/json')
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                return json.loads(r.read()), r.status, None
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode('utf-8', 'replace')
+            try:
+                return json.loads(detail), e.code, None
+            except ValueError:
+                return None, e.code, f'HTTP {e.code}: {detail[:160]}'
+        except Exception as e:                       # noqa: BLE001
+            return None, None, str(e)
+
+    # A server that does not implement an endpoint, as opposed to one that
+    # does and disliked the query.
+    NO_SUCH_ENDPOINT = (404, 405, 501)
+
+    def cypher(self, q):
+        """Same contract as Instance.cypher: (rows, error).
+
+        Two wire formats.  The query API that returns typed JSON directly
+        (/query/v2) arrived in 5.23; the transactional endpoint predates it
+        and is still there.  Whichever answers is remembered, so the probe
+        costs one extra request per run rather than one per query.
+        """
+        if self._endpoint in (None, 'v2'):
+            payload, status, err = self._post(f'/db/{self.db}/query/v2',
+                                              {'statement': q})
+            if status in self.NO_SUCH_ENDPOINT and self._endpoint is None:
+                pass                            # older server; try the legacy API
+            elif payload is not None and 'data' in payload:
+                self._endpoint = 'v2'
+                return (payload['data'] or {}).get('values') or [], None
+            elif payload is not None and payload.get('errors'):
+                self._endpoint = 'v2'
+                return None, self._error_text(payload['errors'])
+            else:
+                return None, err or 'no data in response'
+
+        payload, status, err = self._post(
+            f'/db/{self.db}/tx/commit',
+            {'statements': [{'statement': q}]})
+        if payload is None:
+            return None, err or 'no response'
+        if payload.get('errors'):
+            return None, self._error_text(payload['errors'])
+        self._endpoint = 'tx'
+        results = payload.get('results') or [{}]
+        rows = (results[0] or {}).get('data') or []
+        return [r.get('row') for r in rows], None
+
+    @staticmethod
+    def _error_text(errors):
+        first = errors[0] if errors else {}
+        return (first.get('message') or first.get('error')
+                or first.get('code') or str(first))[:200]
+
+    def scalar(self, q, default=None):
+        rows, err = self.cypher(q)
+        if err or not rows:
+            return default
+        return rows[0][0]
+
+    def request(self, method, path, body=None, params=None):
+        """There is no neuPrintHTTP in front of a snapshot."""
+        return (None, 0.0,
+                'not served: this side is a snapshot directory, not a server')
 
 
 # --------------------------------------------------------------------------
@@ -574,9 +912,14 @@ def layer_identity(a, b, rep):
     parallel release, so they are reported and never counted as failures."""
     rep('\n--- instance identity (differences here are expected) ---')
     for inst, side in ((a, 'A'), (b, 'B')):
-        ver, _, _ = inst.request('GET', '/api/version')
         neo = inst.scalar('CALL dbms.components() YIELD versions '
                           'RETURN versions[0]')
+        if inst.is_snapshot:
+            # Width matches 'neuPrintHTTP <version>' so the neo4j column
+            # still lines up against the served side.
+            rep(f'  {side}  {inst.label:<28} {"not served":<23} neo4j {neo}')
+            continue
+        ver, _, _ = inst.request('GET', '/api/version')
         v = (ver or {}).get('Version', '?') if isinstance(ver, dict) else '?'
         rep(f'  {side}  {inst.label:<28} neuPrintHTTP {v:<10} neo4j {neo}')
 
@@ -1200,24 +1543,46 @@ def layer_timing(a, b, catalog, reps, tolerance, rep):
 
 # --------------------------------------------------------------------------
 
-def parse_endpoints(argv_rest):
-    """Accept either `A B` with server[:dataset], or the legacy
-    `server ds-a ds-b` three-argument form."""
-    if len(argv_rest) == 3 and ':' not in argv_rest[0]:
+def looks_like_snapshot(arg):
+    """A target naming a directory on disk rather than a served dataset.
+
+    Deliberately syntactic: a leading /, ./, ../ or ~, or a name that is
+    already a directory here.  A server target never looks like any of
+    those, and deciding by shape means a typo in a path reports "no such
+    directory" rather than being resolved as a hostname.
+    """
+    return (arg.startswith(('/', './', '../', '~'))
+            or Path(arg).expanduser().is_dir())
+
+
+def parse_endpoints(argv_rest, snapshot_opts=None):
+    """Accept `A B` with server[:dataset], the legacy `server ds-a ds-b`
+    three-argument form, or a snapshot directory in place of either side."""
+    opts = snapshot_opts or {}
+
+    def side(arg, default_dataset=None):
+        if looks_like_snapshot(arg):
+            return SnapshotInstance(arg, **opts)
+        if ':' in arg:
+            server, dataset = arg.split(':', 1)
+            return Instance(server, dataset)
+        if default_dataset is None:
+            raise SystemExit(f'ERROR: {arg!r} must be server:dataset, or a '
+                             'path to a snapshot directory. Run with --help.')
+        return Instance(arg, default_dataset)
+
+    if (len(argv_rest) == 3 and ':' not in argv_rest[0]
+            and not looks_like_snapshot(argv_rest[0])):
         server, ds_a, ds_b = argv_rest
         return Instance(server, ds_a), Instance(server, ds_b)
     if len(argv_rest) == 2:
         first, second = argv_rest
-        if ':' not in first:
-            raise SystemExit('ERROR: A must be server:dataset (or use the '
-                             'three-argument form: server ds-a ds-b)')
-        sa, ds_a = first.split(':', 1)
-        if ':' in second:
-            sb, ds_b = second.split(':', 1)
-        else:
-            sb, ds_b = second, ds_a
-        return Instance(sa, ds_a), Instance(sb, ds_b)
-    raise SystemExit('ERROR: expected "A B" or "server ds-a ds-b". '
+        a = side(first)
+        # `server ds` on the B side reuses A's dataset, but only when A has
+        # one to lend -- a snapshot's is not known until neo4j is running.
+        return a, side(second, None if a.is_snapshot else a.dataset)
+    raise SystemExit('ERROR: expected "A B", "server ds-a ds-b", or a '
+                     'snapshot directory in place of either side. '
                      'Run with --help.')
 
 
@@ -1248,6 +1613,19 @@ def main(argv):
                         'body prove only that those are served. Raise it to '
                         'widen that check; 1 restores the old behavior. '
                         'Not --sample, above.')
+    p.add_argument('--snapshot-image', metavar='IMAGE',
+                   help='container image used to start a snapshot side '
+                        f'(default {SNAPSHOT_IMAGE}, or $NEO4J_IMAGE)')
+    p.add_argument('--snapshot-heap', metavar='SIZE',
+                   help='override the snapshot conf\'s heap size, e.g. 8G. '
+                        'The stock template asks for 31G, which a smaller '
+                        'host will refuse to start with.')
+    p.add_argument('--snapshot-pagecache', metavar='SIZE',
+                   help='override the snapshot conf\'s page cache, e.g. 8G '
+                        '(the stock template asks for 150G)')
+    p.add_argument('--snapshot-db', metavar='NAME', default='data',
+                   help='database inside the snapshot (default data, which '
+                        'is what the CalVer import pipeline builds)')
     p.add_argument('--no-report', action='store_true',
                    help='do not write results/<a>-vs-<b>-<stamp>.txt')
     add_color_argument(p)
@@ -1258,8 +1636,11 @@ def main(argv):
         print(__doc__)
         return 2
 
-    a, b = parse_endpoints(args.targets)
-    if not a.token or not b.token:
+    a, b = parse_endpoints(args.targets, snapshot_opts=dict(
+        image=args.snapshot_image, heap=args.snapshot_heap,
+        pagecache=args.snapshot_pagecache, db=args.snapshot_db))
+    # Only a served side needs a token; a snapshot authenticates to nothing.
+    if any(not s.token for s in (a, b) if not s.is_snapshot):
         print('ERROR: set NEUPRINT_JWT (or NEUPRINT_TOKEN). An anonymous '
               'client is shown fewer datasets and may not see these at all.',
               file=sys.stderr)
@@ -1269,6 +1650,31 @@ def main(argv):
                    baseline=load_baseline(args.baseline))
     started = datetime.now(timezone.utc)
     rep(f'compare-datasets  {started.strftime("%Y-%m-%d %H:%M:%SZ")}')
+
+    snapshots = [s for s in (a, b) if s.is_snapshot]
+    if snapshots:
+        rep('\n--- starting snapshot side(s) ---')
+        for s in snapshots:
+            # Registered before the start attempt, not after: a start that
+            # times out may still have left a server running, and that one
+            # has to be stopped too.
+            atexit.register(s.stop)
+            if not s.start(rep):
+                rep.print_fatals()
+                rep(f'\nRESULT: {rep.s.red("INCOMPLETE -- nothing was compared")}')
+                return 2
+        # Every remaining HTTP layer asks neuPrintHTTP, and nothing is
+        # serving this directory.  Turn them off here rather than letting
+        # them fail a row at a time against an error that says the same
+        # thing twenty times.
+        if not (args.no_endpoints and args.no_timing):
+            rep(rep.s.dim('  endpoint, timing and path-encoding layers '
+                          'skipped: they need neuPrintHTTP,'))
+            rep(rep.s.dim('  which does not serve a snapshot directory. '
+                          'Data, connectivity, indexes and'))
+            rep(rep.s.dim('  config are Cypher-only and run normally.'))
+        args.no_endpoints = args.no_timing = True
+
     rep(f'  A  {a.server}  dataset {a.dataset}')
     rep(f'  B  {b.server}  dataset {b.dataset}')
 
@@ -1360,6 +1766,13 @@ def main(argv):
         path = RESULTS / f'{a.label}-vs-{b.label}-{stamp}.txt'.replace('/', '_')
         rep.write(path)
         print(f'\nreport: {path}')
+
+    # Explicit, so the container is gone before this returns rather than
+    # whenever the interpreter gets round to its atexit handlers. stop() is
+    # idempotent, so the registered copy is a safety net for the paths that
+    # do not reach here.
+    for s in snapshots:
+        s.stop()
     return exit_code
 
 

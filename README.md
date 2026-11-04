@@ -120,6 +120,36 @@ default `--samples 3`.
 ./compare/compare-datasets.py neuprint-pre:yakuba neuprint-test --no-timing
 ```
 
+#### Comparing a snapshot before it is copied
+
+Either side may be a **snapshot directory** — the `conf/ data/ logs/ plugins/`
+tree flyem-snapshot writes, before anyone copies it to a server:
+
+```bash
+./compare/compare-datasets.py /groups/.../wasp3-v0.0/neo4j neuprint-pre:wasp3:v1.0
+```
+
+neo4j is started on that directory in a container, queried, and stopped again.
+The point is to run the comparison **before** the copy: a count discrepancy
+found now costs a re-export, found afterwards it costs the transfer as well.
+
+Four of the five layers — data, connectivity, indexes, config — only ask Cypher
+questions, so they run unchanged. The endpoint, timing and path-encoding layers
+need neuPrintHTTP, and nothing is serving a directory; they are skipped with a
+notice rather than failing a row at a time.
+
+Needs `apptainer`, so run it where the snapshot lives. The stock snapshot conf
+asks for a 31G heap and a 150G page cache — on a smaller host, pass
+`--snapshot-heap 8G --snapshot-pagecache 8G`. Ports are picked free at startup
+and bound to loopback, so this never collides with a neo4j already running on
+the node.
+
+Starting the server also reads `Meta.tag`, which is what neuPrintHTTP composes
+the served name from (`dataset:tag`). `check-neuprint-snapshot` does not look
+at it, and an empty one is what makes a parallel release collide — so the
+report names this side the way it will actually be served, and says so when
+there is no tag.
+
 The endpoint table carries a **`cl` column** saying which client drives each
 endpoint, so a difference can be traced to the thing that will actually break:
 
