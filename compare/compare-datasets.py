@@ -286,6 +286,34 @@ exec neo4j console
 '''
 
 
+# apptainer was renamed from singularity, and a cluster may carry either --
+# often only behind `module load`.  Both take the same exec/--writable-tmpfs
+# arguments, so either will do.
+CONTAINER_RUNTIMES = ('apptainer', 'singularity')
+
+
+def find_container_runtime(explicit=None):
+    """Path to apptainer, or to singularity under its older name.
+
+    An explicit choice wins, then $APPTAINER_EXEC, then whatever is on PATH.
+    Returns None if nothing was found, which the caller turns into advice
+    rather than a traceback.
+    """
+    candidates = ([explicit] if explicit
+                  else [os.environ.get('APPTAINER_EXEC')] + list(CONTAINER_RUNTIMES))
+    for cand in candidates:
+        if not cand:
+            continue
+        found = shutil.which(cand)
+        if found:
+            return found
+        # An absolute path to a runtime that is installed but not on PATH,
+        # which is the usual shape of this problem on a login node.
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 def free_port():
     """A port nothing is listening on, as of now.
 
@@ -312,12 +340,15 @@ class SnapshotInstance:
 
     is_snapshot = True
 
-    def __init__(self, path, image=None, heap=None, pagecache=None, db='data'):
+    def __init__(self, path, image=None, heap=None, pagecache=None,
+                 db='data', runtime=None):
         self.path = Path(path).expanduser().resolve()
         self.image = image or os.environ.get('NEO4J_IMAGE') or SNAPSHOT_IMAGE
         self.heap = heap
         self.pagecache = pagecache
         self.db = db
+        self.runtime_hint = runtime
+        self.runtime = None             # resolved by check_layout()
         self.server = f'snapshot {self.path}'
         self.label = f'snapshot:{self.path.parent.name}'
         self.dataset = self.path.parent.name
@@ -347,10 +378,15 @@ class SnapshotInstance:
         if len(jars) > 1:
             return (f'{len(jars)} apoc jars in {self.path}/plugins -- only one '
                     f'may be present: {", ".join(j.name for j in jars)}')
-        if shutil.which('apptainer') is None:
-            return ('apptainer is not on PATH. A snapshot side needs it to '
-                    'start neo4j on the directory; run this where the '
-                    'snapshot lives.')
+        self.runtime = find_container_runtime(self.runtime_hint)
+        if self.runtime is None:
+            looked = ', '.join(CONTAINER_RUNTIMES)
+            return (f'no container runtime found (looked for: {looked}). '
+                    'A snapshot side needs one to start neo4j on the '
+                    'directory. On a cluster it is usually installed but not '
+                    'on PATH -- try `module avail apptainer` and load it, or '
+                    'point at it with --container-exec /path/to/apptainer '
+                    '(or $APPTAINER_EXEC).')
         return None
 
     def start(self, rep):
@@ -368,29 +404,41 @@ class SnapshotInstance:
         self.console_log = self.work / 'console.log'
 
         env = os.environ.copy()
-        env['APPTAINER_BIND'] = ','.join([
+        binds = ','.join([
             f'{self.path}/conf:/conf',
             f'{self.path}/data:/data',
             f'{self.path}/logs:/logs',
             f'{self.path}/plugins:/plugins',
             f'{self.work}:/boot',
         ])
-        env['APPTAINERENV_HTTP_PORT'] = str(self.http_port)
-        env['APPTAINERENV_BOLT_PORT'] = str(self.bolt_port)
-        env['APPTAINERENV_HEAP_SIZE'] = self.heap or ''
-        env['APPTAINERENV_PAGECACHE'] = self.pagecache or ''
-        # cypher-shell is not used here, but neo4j itself sizes its GC and
-        # Netty pools from availableProcessors(); on a 128-core node that is
-        # hundreds of threads it has no use for.
-        env['APPTAINERENV_JAVA_OPTS'] = (
-            os.environ.get('JAVA_OPTS', '') + ' -XX:ActiveProcessorCount=4').strip()
+        inner = {
+            'HTTP_PORT': str(self.http_port),
+            'BOLT_PORT': str(self.bolt_port),
+            'HEAP_SIZE': self.heap or '',
+            'PAGECACHE': self.pagecache or '',
+            # neo4j sizes its GC and Netty pools from availableProcessors();
+            # on a 128-core login node that is hundreds of threads it has no
+            # use for, and the node is shared.
+            'JAVA_OPTS': (os.environ.get('JAVA_OPTS', '')
+                          + ' -XX:ActiveProcessorCount=4').strip(),
+        }
+        # Both prefixes, because the two runtimes read different ones and
+        # setting the wrong one fails silently: the variable is simply absent
+        # inside the container and boot.sh falls back to the snapshot's own
+        # sizing, which is how you get a 31G heap request on an 8G ask.
+        for prefix in ('APPTAINERENV_', 'SINGULARITYENV_'):
+            for k, v in inner.items():
+                env[prefix + k] = v
+        env['APPTAINER_BIND'] = binds
+        env['SINGULARITY_BIND'] = binds
 
         rep(f'  starting neo4j on {self.path}')
         rep(rep.s.dim(f'    image {self.image}, database {self.db}, '
                       f'http port {self.http_port}'))
+        rep(rep.s.dim(f'    runtime {self.runtime}'))
         with open(self.console_log, 'wb') as out:
             self.proc = subprocess.Popen(
-                ['apptainer', 'exec', '--writable-tmpfs', self.image,
+                [self.runtime, 'exec', '--writable-tmpfs', self.image,
                  'bash', '/boot/boot.sh'],
                 stdout=out, stderr=subprocess.STDOUT, env=env,
                 stdin=subprocess.DEVNULL)
@@ -1623,6 +1671,12 @@ def main(argv):
     p.add_argument('--snapshot-pagecache', metavar='SIZE',
                    help='override the snapshot conf\'s page cache, e.g. 8G '
                         '(the stock template asks for 150G)')
+    p.add_argument('--container-exec', metavar='PATH',
+                   help='apptainer/singularity to start a snapshot side with. '
+                        'Default: whichever of '
+                        + ', '.join(CONTAINER_RUNTIMES) + ' is on PATH, or '
+                        '$APPTAINER_EXEC. Give a full path when it is '
+                        'installed but not on PATH.')
     p.add_argument('--snapshot-db', metavar='NAME', default='data',
                    help='database inside the snapshot (default data, which '
                         'is what the CalVer import pipeline builds)')
@@ -1638,7 +1692,8 @@ def main(argv):
 
     a, b = parse_endpoints(args.targets, snapshot_opts=dict(
         image=args.snapshot_image, heap=args.snapshot_heap,
-        pagecache=args.snapshot_pagecache, db=args.snapshot_db))
+        pagecache=args.snapshot_pagecache, db=args.snapshot_db,
+        runtime=args.container_exec))
     # Only a served side needs a token; a snapshot authenticates to nothing.
     if any(not s.token for s in (a, b) if not s.is_snapshot):
         print('ERROR: set NEUPRINT_JWT (or NEUPRINT_TOKEN). An anonymous '
