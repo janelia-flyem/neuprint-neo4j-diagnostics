@@ -277,10 +277,21 @@ sed -i -e '/^server\.http\.listen_address=/d' \
     echo "server.bolt.listen_address=127.0.0.1:${BOLT_PORT}"
 } >> "${CONF}"
 
-# This log lives in the snapshot directory and PERSISTS between runs, so a
-# stale startup line from an earlier run would satisfy the host's wait while
-# this start was still failing.  Truncate first.
-: > /logs/neo4j.log
+# Breadcrumbs for the host.  This script's stdout is captured per run and
+# cannot be stale, which is more than can be said for the log file below.
+echo "boot: http=${HTTP_PORT} bolt=${BOLT_PORT} heap=${HEAP_SIZE:-<snapshot default>} pagecache=${PAGECACHE:-<snapshot default>}"
+echo "boot: effective listen addresses:"
+grep -E '^server\.(http|bolt)\.listen_address=' "${CONF}" | sed 's/^/boot:   /'
+
+# This log lives in the snapshot directory and PERSISTS between runs -- it
+# survives every run anyone has ever made against this snapshot.  Truncating
+# it is what makes it evidence about THIS run, so say plainly when that
+# fails rather than leaving an hour-old success to be read as a live one.
+if : > /logs/neo4j.log 2>/dev/null; then
+    echo "boot: truncated /logs/neo4j.log"
+else
+    echo "boot: WARNING /logs is not writable -- neo4j.log is NOT from this run"
+fi
 
 exec neo4j console
 '''
@@ -357,6 +368,7 @@ class SnapshotInstance:
         self.work = None
         self.http_port = None
         self.bolt_port = None
+        self.launched_at = 0.0
         self._endpoint = None           # whichever query API answered first
 
     # -- lifecycle --------------------------------------------------------
@@ -436,6 +448,7 @@ class SnapshotInstance:
         rep(rep.s.dim(f'    image {self.image}, database {self.db}, '
                       f'http port {self.http_port}'))
         rep(rep.s.dim(f'    runtime {self.runtime}'))
+        self.launched_at = time.time()
         with open(self.console_log, 'wb') as out:
             self.proc = subprocess.Popen(
                 [self.runtime, 'exec', '--writable-tmpfs', self.image,
@@ -477,21 +490,59 @@ class SnapshotInstance:
         return True
 
     def _report_log(self, rep):
-        tail = ''
-        for candidate in (self.path / 'logs' / 'neo4j.log', self.console_log):
-            try:
-                tail = candidate.read_text(errors='replace')[-1500:]
-            except OSError:
-                continue
-            if tail.strip():
-                rep(rep.s.dim(f'    --- {candidate} (tail) ---'))
-                for line in tail.strip().splitlines()[-15:]:
-                    rep(rep.s.dim(f'    {line}'))
-                break
-        if 'OutOfMemoryError' in tail or 'heap' in tail.lower():
-            rep(rep.s.yellow('    The snapshot conf asks for a 31G heap and a '
-                             '150G page cache by default.'))
-            rep(rep.s.yellow('    Try --snapshot-heap 8G --snapshot-pagecache 8G.'))
+        """Show what THIS run produced.
+
+        The container's own stdout is captured per run and cannot be stale.
+        logs/neo4j.log can be: it lives in the snapshot directory and
+        survives every run anyone has made against it, including
+        check-neuprint-snapshot's.  Reading that one first hid a startup
+        failure behind an hour-old success -- the file said "Started." and
+        the process had exited 1 -- so it is dated before it is believed.
+        """
+        shown = False
+        try:
+            console = self.console_log.read_text(errors='replace').strip()
+        except OSError:
+            console = ''
+        if console:
+            rep(rep.s.dim('    --- container output (this run) ---'))
+            for line in console.splitlines()[-25:]:
+                rep(rep.s.dim(f'    {line}'))
+            shown = True
+
+        log = self.path / 'logs' / 'neo4j.log'
+        try:
+            # A couple of seconds of slack: the file is truncated inside the
+            # container a moment after we launch it.
+            fresh = log.stat().st_mtime >= self.launched_at - 5
+            text = log.read_text(errors='replace').strip()
+        except OSError:
+            text, fresh = '', False
+        if text and fresh:
+            rep(rep.s.dim('    --- logs/neo4j.log (this run) ---'))
+            for line in text.splitlines()[-25:]:
+                rep(rep.s.dim(f'    {line}'))
+            shown = True
+        elif text:
+            rep(rep.s.yellow('    logs/neo4j.log predates this run -- '
+                             'ignoring it.'))
+            rep(rep.s.dim('    It is left over from an earlier run against '
+                          'this snapshot. If the container could'))
+            rep(rep.s.dim('    not truncate it, /logs is not writable from '
+                          'here -- see the boot: lines above.'))
+        if not shown:
+            rep(rep.s.dim('    (nothing captured -- the runtime produced no '
+                          'output at all)'))
+
+        # Only this run's output may justify a diagnosis.
+        blob = console + (text if fresh else '')
+        if 'OutOfMemoryError' in blob or 'Could not create the Java' in blob:
+            rep(rep.s.yellow('    This looks like memory. The snapshot conf '
+                             'asks for a 31G heap and a 150G'))
+            rep(rep.s.yellow('    page cache by default; under LSF the job '
+                             'also has to be allowed that much.'))
+            rep(rep.s.yellow('    Try --snapshot-heap 4G --snapshot-pagecache '
+                             '4G, and bsub -R "rusage[mem=...]".'))
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
