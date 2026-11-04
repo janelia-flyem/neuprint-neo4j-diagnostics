@@ -296,12 +296,20 @@ echo "server.directories.logs=/logs" >> "${CONF}"
 echo "boot: http=${HTTP_PORT} bolt=${BOLT_PORT} heap=${HEAP_SIZE:-<snapshot default>} pagecache=${PAGECACHE:-<snapshot default>}"
 echo "boot: listen addresses and log dir in effect:"
 grep -E '^server\.(http|bolt)\.listen_address=|^server\.directories\.logs=' "${CONF}" | sed 's/^/boot:   /'
-# The store itself still has to be writable -- neo4j takes a lock and writes
-# transaction logs even when only read from -- so say now whether it is.
+# Prove the bind mounts actually landed.  If they were dropped, /data is the
+# image's own empty directory owned by the neo4j user, and every later
+# symptom -- permission denied on a log, a store with no databases in it --
+# describes that one fact badly.
+echo "boot: /data contains: $(ls /data 2>/dev/null | tr '\n' ' ' | head -c 120)"
 if [[ -w /data ]]; then
     echo "boot: /data is writable"
 else
-    echo "boot: WARNING /data is NOT writable -- neo4j cannot open a store read-only"
+    echo "boot: WARNING /data is NOT writable -- the bind was dropped, or it is not yours"
+fi
+if [[ -w /logs ]]; then
+    echo "boot: /logs is writable"
+else
+    echo "boot: WARNING /logs is NOT writable -- the bind was dropped"
 fi
 
 exec neo4j console
@@ -431,13 +439,14 @@ class SnapshotInstance:
         # logs/ is neither needed nor touched.
         scratch_logs = self.work / 'logs'
         scratch_logs.mkdir(exist_ok=True)
-        binds = ','.join([
+        self.binds = [
             f'{self.path}/conf:/conf',
             f'{self.path}/data:/data',
             f'{scratch_logs}:/logs',
             f'{self.path}/plugins:/plugins',
             f'{self.work}:/boot',
-        ])
+        ]
+        binds = ','.join(self.binds)
         inner = {
             'HTTP_PORT': str(self.http_port),
             'BOLT_PORT': str(self.bolt_port),
@@ -465,9 +474,18 @@ class SnapshotInstance:
         rep(rep.s.dim(f'    runtime {self.runtime}'))
         self.launched_at = time.time()
         with open(self.console_log, 'wb') as out:
+            # Binds go on the command line as well as in the environment.
+            # A site that sets `user bind control = no` in apptainer.conf
+            # ignores the environment variable SILENTLY: /data and /logs are
+            # then the image's own directories, owned by the neo4j user, and
+            # the server fails on permissions with nothing saying a mount was
+            # dropped.  An explicit --bind is refused out loud instead.
+            bind_args = []
+            for spec in self.binds:
+                bind_args += ['--bind', spec]
             self.proc = subprocess.Popen(
-                [self.runtime, 'exec', '--writable-tmpfs', self.image,
-                 'bash', '/boot/boot.sh'],
+                [self.runtime, 'exec', '--writable-tmpfs', *bind_args,
+                 self.image, 'bash', '/boot/boot.sh'],
                 stdout=out, stderr=subprocess.STDOUT, env=env,
                 stdin=subprocess.DEVNULL)
 
