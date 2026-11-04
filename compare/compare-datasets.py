@@ -277,20 +277,31 @@ sed -i -e '/^server\.http\.listen_address=/d' \
     echo "server.bolt.listen_address=127.0.0.1:${BOLT_PORT}"
 } >> "${CONF}"
 
-# Breadcrumbs for the host.  This script's stdout is captured per run and
-# cannot be stale, which is more than can be said for the log file below.
-echo "boot: http=${HTTP_PORT} bolt=${BOLT_PORT} heap=${HEAP_SIZE:-<snapshot default>} pagecache=${PAGECACHE:-<snapshot default>}"
-echo "boot: effective listen addresses:"
-grep -E '^server\.(http|bolt)\.listen_address=' "${CONF}" | sed 's/^/boot:   /'
+# Logs go to a scratch directory on the host, never into the snapshot.
+#
+# The snapshot's own logs/ was written by whatever account built it, and is
+# routinely not writable by whoever runs this -- neo4j then fails to start
+# with twenty lines about log4j appenders and nothing about permissions.
+# Beyond that, a check that runs BEFORE the copy has no business modifying
+# the thing it is checking.
+#
+# Set as an absolute path rather than relying on the image symlinking
+# ${NEO4J_HOME}/logs to /logs, which is true of the official image and is
+# not a promise.
+sed -i -e '/^server\.directories\.logs=/d' "${CONF}"
+echo "server.directories.logs=/logs" >> "${CONF}"
 
-# This log lives in the snapshot directory and PERSISTS between runs -- it
-# survives every run anyone has ever made against this snapshot.  Truncating
-# it is what makes it evidence about THIS run, so say plainly when that
-# fails rather than leaving an hour-old success to be read as a live one.
-if : > /logs/neo4j.log 2>/dev/null; then
-    echo "boot: truncated /logs/neo4j.log"
+# Breadcrumbs for the host.  This script's stdout is captured per run, so
+# it is the one account of the start that cannot be stale or absent.
+echo "boot: http=${HTTP_PORT} bolt=${BOLT_PORT} heap=${HEAP_SIZE:-<snapshot default>} pagecache=${PAGECACHE:-<snapshot default>}"
+echo "boot: listen addresses and log dir in effect:"
+grep -E '^server\.(http|bolt)\.listen_address=|^server\.directories\.logs=' "${CONF}" | sed 's/^/boot:   /'
+# The store itself still has to be writable -- neo4j takes a lock and writes
+# transaction logs even when only read from -- so say now whether it is.
+if [[ -w /data ]]; then
+    echo "boot: /data is writable"
 else
-    echo "boot: WARNING /logs is not writable -- neo4j.log is NOT from this run"
+    echo "boot: WARNING /data is NOT writable -- neo4j cannot open a store read-only"
 fi
 
 exec neo4j console
@@ -416,10 +427,14 @@ class SnapshotInstance:
         self.console_log = self.work / 'console.log'
 
         env = os.environ.copy()
+        # /logs is scratch on purpose -- see boot.sh.  The snapshot's own
+        # logs/ is neither needed nor touched.
+        scratch_logs = self.work / 'logs'
+        scratch_logs.mkdir(exist_ok=True)
         binds = ','.join([
             f'{self.path}/conf:/conf',
             f'{self.path}/data:/data',
-            f'{self.path}/logs:/logs',
+            f'{scratch_logs}:/logs',
             f'{self.path}/plugins:/plugins',
             f'{self.work}:/boot',
         ])
@@ -499,50 +514,65 @@ class SnapshotInstance:
         failure behind an hour-old success -- the file said "Started." and
         the process had exited 1 -- so it is dated before it is believed.
         """
-        shown = False
-        try:
-            console = self.console_log.read_text(errors='replace').strip()
-        except OSError:
-            console = ''
-        if console:
-            rep(rep.s.dim('    --- container output (this run) ---'))
-            for line in console.splitlines()[-25:]:
-                rep(rep.s.dim(f'    {line}'))
-            shown = True
+        def read(path):
+            try:
+                return path.read_text(errors='replace').strip()
+            except OSError:
+                return ''
 
-        log = self.path / 'logs' / 'neo4j.log'
-        try:
-            # A couple of seconds of slack: the file is truncated inside the
-            # container a moment after we launch it.
-            fresh = log.stat().st_mtime >= self.launched_at - 5
-            text = log.read_text(errors='replace').strip()
-        except OSError:
-            text, fresh = '', False
-        if text and fresh:
-            rep(rep.s.dim('    --- logs/neo4j.log (this run) ---'))
-            for line in text.splitlines()[-25:]:
-                rep(rep.s.dim(f'    {line}'))
-            shown = True
-        elif text:
-            rep(rep.s.yellow('    logs/neo4j.log predates this run -- '
-                             'ignoring it.'))
-            rep(rep.s.dim('    It is left over from an earlier run against '
-                          'this snapshot. If the container could'))
-            rep(rep.s.dim('    not truncate it, /logs is not writable from '
-                          'here -- see the boot: lines above.'))
-        if not shown:
+        console = read(self.console_log)
+        lines = console.splitlines()
+        # boot.sh's own lines come first and are the ones that say what this
+        # run was configured to do, so they are never elided -- a tail-only
+        # view dropped them behind twenty lines of log4j and left the report
+        # saying nothing about the ports or the log directory.
+        boot = [ln for ln in lines if ln.startswith('boot:')]
+        rest = [ln for ln in lines if not ln.startswith('boot:')]
+        if boot:
+            rep(rep.s.dim('    --- boot (this run) ---'))
+            for ln in boot:
+                rep(rep.s.dim(f'    {ln}'))
+        if rest:
+            rep(rep.s.dim('    --- container output (this run) ---'))
+            # Head and tail: a startup failure states its cause in the first
+            # lines and its conclusion in the last, and fills the middle with
+            # repetition of the same complaint.
+            head, tail = rest[:8], rest[-8:]
+            for ln in head:
+                rep(rep.s.dim(f'    {ln}'))
+            if len(rest) > len(head) + len(tail):
+                rep(rep.s.dim(f'    ... {len(rest) - len(head) - len(tail)} '
+                              'more lines ...'))
+            for ln in tail[max(0, len(head) + len(tail) - len(rest)):]:
+                rep(rep.s.dim(f'    {ln}'))
+
+        # Our own scratch copy, created fresh per run, so it cannot be a
+        # leftover the way the snapshot's logs/neo4j.log can.
+        server_log = read(self.work / 'logs' / 'neo4j.log') if self.work else ''
+        if server_log:
+            rep(rep.s.dim('    --- neo4j.log (this run) ---'))
+            for ln in server_log.splitlines()[-15:]:
+                rep(rep.s.dim(f'    {ln}'))
+        if not (console or server_log):
             rep(rep.s.dim('    (nothing captured -- the runtime produced no '
                           'output at all)'))
 
-        # Only this run's output may justify a diagnosis.
-        blob = console + (text if fresh else '')
+        blob = console + server_log
         if 'OutOfMemoryError' in blob or 'Could not create the Java' in blob:
             rep(rep.s.yellow('    This looks like memory. The snapshot conf '
                              'asks for a 31G heap and a 150G'))
-            rep(rep.s.yellow('    page cache by default; under LSF the job '
-                             'also has to be allowed that much.'))
+            rep(rep.s.yellow('    page cache by default, and under LSF the '
+                             'job has to be allowed that much.'))
             rep(rep.s.yellow('    Try --snapshot-heap 4G --snapshot-pagecache '
                              '4G, and bsub -R "rusage[mem=...]".'))
+        elif 'Permission denied' in blob or '/data is NOT writable' in blob:
+            rep(rep.s.yellow('    This looks like permissions on the snapshot '
+                             'itself.'))
+            rep(rep.s.yellow('    neo4j takes a lock and writes transaction '
+                             'logs even when only read from,'))
+            rep(rep.s.yellow('    so data/ has to be writable by you. Check '
+                             'who owns it; if it belongs to'))
+            rep(rep.s.yellow('    the build account, work from a copy.'))
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
