@@ -277,10 +277,40 @@ sed -i -e '/^server\.http\.listen_address=/d' \
     echo "server.bolt.listen_address=127.0.0.1:${BOLT_PORT}"
 } >> "${CONF}"
 
-# This log lives in the snapshot directory and PERSISTS between runs, so a
-# stale startup line from an earlier run would satisfy the host's wait while
-# this start was still failing.  Truncate first.
-: > /logs/neo4j.log
+# Logs go to a scratch directory on the host, never into the snapshot.
+#
+# The snapshot's own logs/ was written by whatever account built it, and is
+# routinely not writable by whoever runs this -- neo4j then fails to start
+# with twenty lines about log4j appenders and nothing about permissions.
+# Beyond that, a check that runs BEFORE the copy has no business modifying
+# the thing it is checking.
+#
+# Set as an absolute path rather than relying on the image symlinking
+# ${NEO4J_HOME}/logs to /logs, which is true of the official image and is
+# not a promise.
+sed -i -e '/^server\.directories\.logs=/d' "${CONF}"
+echo "server.directories.logs=/logs" >> "${CONF}"
+
+# Breadcrumbs for the host.  This script's stdout is captured per run, so
+# it is the one account of the start that cannot be stale or absent.
+echo "boot: http=${HTTP_PORT} bolt=${BOLT_PORT} heap=${HEAP_SIZE:-<snapshot default>} pagecache=${PAGECACHE:-<snapshot default>}"
+echo "boot: listen addresses and log dir in effect:"
+grep -E '^server\.(http|bolt)\.listen_address=|^server\.directories\.logs=' "${CONF}" | sed 's/^/boot:   /'
+# Prove the bind mounts actually landed.  If they were dropped, /data is the
+# image's own empty directory owned by the neo4j user, and every later
+# symptom -- permission denied on a log, a store with no databases in it --
+# describes that one fact badly.
+echo "boot: /data contains: $(ls /data 2>/dev/null | tr '\n' ' ' | head -c 120)"
+if [[ -w /data ]]; then
+    echo "boot: /data is writable"
+else
+    echo "boot: WARNING /data is NOT writable -- the bind was dropped, or it is not yours"
+fi
+if [[ -w /logs ]]; then
+    echo "boot: /logs is writable"
+else
+    echo "boot: WARNING /logs is NOT writable -- the bind was dropped"
+fi
 
 exec neo4j console
 '''
@@ -357,6 +387,7 @@ class SnapshotInstance:
         self.work = None
         self.http_port = None
         self.bolt_port = None
+        self.launched_at = 0.0
         self._endpoint = None           # whichever query API answered first
 
     # -- lifecycle --------------------------------------------------------
@@ -404,13 +435,18 @@ class SnapshotInstance:
         self.console_log = self.work / 'console.log'
 
         env = os.environ.copy()
-        binds = ','.join([
+        # /logs is scratch on purpose -- see boot.sh.  The snapshot's own
+        # logs/ is neither needed nor touched.
+        scratch_logs = self.work / 'logs'
+        scratch_logs.mkdir(exist_ok=True)
+        self.binds = [
             f'{self.path}/conf:/conf',
             f'{self.path}/data:/data',
-            f'{self.path}/logs:/logs',
+            f'{scratch_logs}:/logs',
             f'{self.path}/plugins:/plugins',
             f'{self.work}:/boot',
-        ])
+        ]
+        binds = ','.join(self.binds)
         inner = {
             'HTTP_PORT': str(self.http_port),
             'BOLT_PORT': str(self.bolt_port),
@@ -436,10 +472,20 @@ class SnapshotInstance:
         rep(rep.s.dim(f'    image {self.image}, database {self.db}, '
                       f'http port {self.http_port}'))
         rep(rep.s.dim(f'    runtime {self.runtime}'))
+        self.launched_at = time.time()
         with open(self.console_log, 'wb') as out:
+            # Binds go on the command line as well as in the environment.
+            # A site that sets `user bind control = no` in apptainer.conf
+            # ignores the environment variable SILENTLY: /data and /logs are
+            # then the image's own directories, owned by the neo4j user, and
+            # the server fails on permissions with nothing saying a mount was
+            # dropped.  An explicit --bind is refused out loud instead.
+            bind_args = []
+            for spec in self.binds:
+                bind_args += ['--bind', spec]
             self.proc = subprocess.Popen(
-                [self.runtime, 'exec', '--writable-tmpfs', self.image,
-                 'bash', '/boot/boot.sh'],
+                [self.runtime, 'exec', '--writable-tmpfs', *bind_args,
+                 self.image, 'bash', '/boot/boot.sh'],
                 stdout=out, stderr=subprocess.STDOUT, env=env,
                 stdin=subprocess.DEVNULL)
 
@@ -477,21 +523,74 @@ class SnapshotInstance:
         return True
 
     def _report_log(self, rep):
-        tail = ''
-        for candidate in (self.path / 'logs' / 'neo4j.log', self.console_log):
+        """Show what THIS run produced.
+
+        The container's own stdout is captured per run and cannot be stale.
+        logs/neo4j.log can be: it lives in the snapshot directory and
+        survives every run anyone has made against it, including
+        check-neuprint-snapshot's.  Reading that one first hid a startup
+        failure behind an hour-old success -- the file said "Started." and
+        the process had exited 1 -- so it is dated before it is believed.
+        """
+        def read(path):
             try:
-                tail = candidate.read_text(errors='replace')[-1500:]
+                return path.read_text(errors='replace').strip()
             except OSError:
-                continue
-            if tail.strip():
-                rep(rep.s.dim(f'    --- {candidate} (tail) ---'))
-                for line in tail.strip().splitlines()[-15:]:
-                    rep(rep.s.dim(f'    {line}'))
-                break
-        if 'OutOfMemoryError' in tail or 'heap' in tail.lower():
-            rep(rep.s.yellow('    The snapshot conf asks for a 31G heap and a '
-                             '150G page cache by default.'))
-            rep(rep.s.yellow('    Try --snapshot-heap 8G --snapshot-pagecache 8G.'))
+                return ''
+
+        console = read(self.console_log)
+        lines = console.splitlines()
+        # boot.sh's own lines come first and are the ones that say what this
+        # run was configured to do, so they are never elided -- a tail-only
+        # view dropped them behind twenty lines of log4j and left the report
+        # saying nothing about the ports or the log directory.
+        boot = [ln for ln in lines if ln.startswith('boot:')]
+        rest = [ln for ln in lines if not ln.startswith('boot:')]
+        if boot:
+            rep(rep.s.dim('    --- boot (this run) ---'))
+            for ln in boot:
+                rep(rep.s.dim(f'    {ln}'))
+        if rest:
+            rep(rep.s.dim('    --- container output (this run) ---'))
+            # Head and tail: a startup failure states its cause in the first
+            # lines and its conclusion in the last, and fills the middle with
+            # repetition of the same complaint.
+            head, tail = rest[:8], rest[-8:]
+            for ln in head:
+                rep(rep.s.dim(f'    {ln}'))
+            if len(rest) > len(head) + len(tail):
+                rep(rep.s.dim(f'    ... {len(rest) - len(head) - len(tail)} '
+                              'more lines ...'))
+            for ln in tail[max(0, len(head) + len(tail) - len(rest)):]:
+                rep(rep.s.dim(f'    {ln}'))
+
+        # Our own scratch copy, created fresh per run, so it cannot be a
+        # leftover the way the snapshot's logs/neo4j.log can.
+        server_log = read(self.work / 'logs' / 'neo4j.log') if self.work else ''
+        if server_log:
+            rep(rep.s.dim('    --- neo4j.log (this run) ---'))
+            for ln in server_log.splitlines()[-15:]:
+                rep(rep.s.dim(f'    {ln}'))
+        if not (console or server_log):
+            rep(rep.s.dim('    (nothing captured -- the runtime produced no '
+                          'output at all)'))
+
+        blob = console + server_log
+        if 'OutOfMemoryError' in blob or 'Could not create the Java' in blob:
+            rep(rep.s.yellow('    This looks like memory. The snapshot conf '
+                             'asks for a 31G heap and a 150G'))
+            rep(rep.s.yellow('    page cache by default, and under LSF the '
+                             'job has to be allowed that much.'))
+            rep(rep.s.yellow('    Try --snapshot-heap 4G --snapshot-pagecache '
+                             '4G, and bsub -R "rusage[mem=...]".'))
+        elif 'Permission denied' in blob or '/data is NOT writable' in blob:
+            rep(rep.s.yellow('    This looks like permissions on the snapshot '
+                             'itself.'))
+            rep(rep.s.yellow('    neo4j takes a lock and writes transaction '
+                             'logs even when only read from,'))
+            rep(rep.s.yellow('    so data/ has to be writable by you. Check '
+                             'who owns it; if it belongs to'))
+            rep(rep.s.yellow('    the build account, work from a copy.'))
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
