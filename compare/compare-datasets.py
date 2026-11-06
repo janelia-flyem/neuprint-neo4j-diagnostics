@@ -1124,12 +1124,35 @@ def check_baseline_applies(a, b, rep):
 
     So a mismatch disables the baseline rather than warning about it: a run
     that cannot be trusted should not be able to report OK.
+
+    MATCHING uuids are necessary but NOT sufficient, and this function says so
+    rather than implying otherwise.  A uuid names a DVID node, and an UNLOCKED
+    node keeps being written to under that same name -- so two builds citing
+    one uuid read the same pointer at different times, not the same data.
+    Verified on yakuba 2026-11-05: `5572acf8fd5d` was the only unlocked node
+    of ~132 in the repo, and the nightly pins to it.  Ten real bodies (108k to
+    1.77M voxels, all present in DVID) appeared between the nightly's build
+    and a CalVer ingest the next day, with both stores reporting that uuid and
+    an identical lastDatabaseEdit.  Nothing here can detect that -- it would
+    take a DVID call -- so the run reports the limit instead of asserting a
+    guarantee it has not checked.
     """
     if not rep.baseline:
         return
     ua = a.scalar('MATCH (m:Meta) RETURN m.uuid')
     ub = b.scalar('MATCH (m:Meta) RETURN m.uuid')
     if not ua or not ub or ua == ub:
+        if ua and ub:
+            # One dim line, on every baselined run: the alternative is a
+            # reader taking "uuid matches" for "same source data", which is
+            # exactly the inference that cost a day on yakuba.
+            rep(rep.s.dim(
+                f'\n  baseline applies -- Meta.uuid matches '
+                f'({str(ua)[:12]}...). Note this means both stores cite the\n'
+                f'  same DVID node, not that they read it at the same time: an '
+                f'unlocked node keeps\n  changing under its own name. Check '
+                f'DAG.Nodes[uuid].Locked before trusting a\n  structural '
+                f'difference, or build both sides from a locked uuid.'))
         return
     rep.heading('--- baseline IGNORED ---')
     rep(f'  {rep.s.red("Meta.uuid differs")}: {str(ua)[:12]}... vs '
@@ -1190,8 +1213,8 @@ def layer_data(a, b, rep):
         if name == 'uuid':
             va, vb = str(va)[:12] + '...', str(vb)[:12] + '...'
         if name == 'lastDatabaseEdit':
-            # Compared on its whole normalized form -- the appended update
-            # history is semantic, and truncating it hid a real difference.
+            # Compared in full -- the appended update history is semantic,
+            # and truncating it hid a real difference.  See the function.
             same &= compare_edit_history(rep, va, vb)
             continue
         same &= row(rep, name, va, vb, cat='meta')
