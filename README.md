@@ -108,11 +108,21 @@ a new stack at once and the question is whether anything a user can reach has
 changed. Takes two `server[:dataset]` targets, so it compares either two
 servers or two datasets on one server.
 
-Five layers: `:Meta` provenance and node counts; a **connectivity sample** that
+Six layers: `:Meta` provenance and node counts; **per-ROI synapse totals**
+summed out of every Segment's `roiInfo`; a **connectivity sample** that
 compares edges and weights for bodies present on both, because matching counts
 prove nothing about which bodies are joined to which; the index inventory;
 server configuration; and **19 read-only endpoints**, 23 responses at the
 default `--samples 3`.
+
+The `roiInfo` layer is there because counts, types and sampled connectivity can
+all match exactly while every ROI figure a user sees is different — observed on
+wasp3, where all 95 ROIs disagreed and the only sign of it was eight endpoints
+flagging downstream. `roiInfo` is stored as a JSON string at CSV import rather
+than computed per query, so a difference in it is always the pipeline that
+built the CSVs, never the server. It needs APOC for the JSON parse and is
+skipped with a warning where that is missing; `--no-roiinfo` turns it off, as
+it is the slowest query in the data layer on a large dataset.
 
 ```bash
 ./compare/compare-datasets.py neuprint-pre:yakuba neuprint-test   # two servers

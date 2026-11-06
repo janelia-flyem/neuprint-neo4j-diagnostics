@@ -33,8 +33,17 @@ directory.  Needs apptainer, so run it where the snapshot lives.
 What it compares, in three layers:
 
   DATA      :Meta provenance, node counts per label, how many Neurons carry
-            each searched annotation property, and type-level differences.
+            each searched annotation property, type-level differences, and
+            per-ROI synapse totals summed out of every Segment's roiInfo.
             This is the original comparison.
+
+            roiInfo earns its place here because it is the one body of data
+            a store can disagree on while every other data check passes:
+            counts, types and sampled connectivity can all match exactly
+            while every ROI figure a user sees is different.  It is also
+            stored rather than computed -- written as a JSON string at CSV
+            import -- so a difference in it is always the pipeline that
+            built the CSVs, never the server that serves them.
 
   FUNCTION  Every read-only neuPrintHTTP endpoint the client actually calls,
             invoked on both instances with identical inputs and the responses
@@ -1153,6 +1162,119 @@ def layer_data(a, b, rep):
     return same
 
 
+ROIINFO_Q = (
+    'MATCH (n:Segment) WHERE n.roiInfo IS NOT NULL '
+    'WITH apoc.convert.fromJsonMap(n.roiInfo) AS m '
+    'UNWIND keys(m) AS roi '
+    'WITH roi, m[roi] AS v '
+    'RETURN roi, sum(coalesce(v.pre, 0)) AS pre, '
+    'sum(coalesce(v.post, 0)) AS post ORDER BY roi'
+)
+
+
+def layer_roiinfo(a, b, rep):
+    """Per-ROI synapse totals, summed out of every Segment's roiInfo.
+
+    roiInfo is a JSON STRING property written at CSV import.  No server
+    computes it, so a difference here is never a Neo4j difference -- it comes
+    from the pipeline run that produced the CSVs.  That is exactly why it
+    belongs in the data layer: it is data, and reporting it among the
+    endpoints invites the wrong conclusion.
+
+    Without this check a store can pass every other data comparison -- node
+    counts, types, sampled connectivity edge-by-edge, index inventory -- and
+    still disagree on every ROI figure a user can see.  Observed on wasp3
+    2026-11-04: all 95 ROIs differed while the data layer reported identical,
+    because two different Phase 1 runs assign synapses to ROIs slightly
+    differently.  Eight endpoints flagged it; none of them said "data".
+
+    The sum is done server-side, so the result is one row per ROI rather than
+    one per body.  Needs APOC for the JSON parse (apoc.convert.fromJsonMap,
+    present in APOC 3.5, 4.x and CalVer alike, and already relied on by
+    neuPrintHTTP itself).  Where it is missing the check is skipped with a
+    warning rather than failing the run -- an absent plugin is not evidence
+    that two stores disagree.
+    """
+    rep('\n--- roiInfo totals per ROI ---')
+    rep(rep.s.dim('  Summed from every Segment. Stored at import, so a '
+                  'difference here is the pipeline, not the server.'))
+
+    ra, ea = a.cypher(ROIINFO_Q)
+    rb, eb = b.cypher(ROIINFO_Q)
+    if ea or eb:
+        side = a.label if ea else b.label
+        rep(rep.s.yellow(f'  skipped -- {side}: {ea or eb}'))
+        rep.warn(f'roiInfo / not compared: {side} could not run the rollup '
+                 f'({ea or eb})')
+        return True
+
+    da = {r[0]: (r[1] or 0, r[2] or 0) for r in (ra or [])}
+    db = {r[0]: (r[1] or 0, r[2] or 0) for r in (rb or [])}
+    if not da and not db:
+        rep(rep.s.dim('  no roiInfo on either side -- nothing to compare'))
+        return True
+
+    same = row(rep, 'ROIs with roiInfo', len(da), len(db), cat='roiInfo')
+
+    only_a = sorted(set(da) - set(db))
+    only_b = sorted(set(db) - set(da))
+    for items, side in ((only_a, a.label), (only_b, b.label)):
+        count = rep.s.red(str(len(items))) if items else rep.s.green('0')
+        rep(f'  only in {side}: {count}')
+        if items:
+            # A renamed ROI lands here, not in the count comparison -- this is
+            # what a property-name change looks like from the outside.
+            rep.diff(f'roiInfo / ROIs only in {side}: {len(items)}')
+            for roi in items[:12]:
+                rep(f'      {roi}')
+            if len(items) > 12:
+                rep(f'      ... and {len(items) - 12} more')
+    same &= not (only_a or only_b)
+
+    shared = sorted(set(da) & set(db))
+    moved = [roi for roi in shared if da[roi] != db[roi]]
+    n = rep.s.red(f'{len(moved)} of {len(shared)}') if moved \
+        else rep.s.green(f'0 of {len(shared)}')
+    rep(f'  ROIs with different totals: {n}')
+    if moved:
+        rep.diff(f'roiInfo / ROIs with different synapse totals: '
+                 f'{len(moved)} of {len(shared)}')
+        # Rank by absolute movement, not alphabetically: when most of the set
+        # moves a little, what matters is which moved most.
+        worst = sorted(moved, key=lambda r: -(abs(db[r][0] - da[r][0])
+                                              + abs(db[r][1] - da[r][1])))
+        rep(rep.s.dim('      largest movers (pre, post):'))
+        for roi in worst[:12]:
+            dpre = db[roi][0] - da[roi][0]
+            dpost = db[roi][1] - da[roi][1]
+            # Percentages keep a big absolute delta on a big ROI from reading
+            # as worse than a small one that moved most of its synapses.
+            pct = ''
+            if da[roi][0] or da[roi][1]:
+                pct = (f'   ({pcts(dpre, da[roi][0])} pre, '
+                       f'{pcts(dpost, da[roi][1])} post)')
+            rep(f'      {roi:<18} pre {dpre:+d}   post {dpost:+d}{pct}')
+        if len(worst) > 12:
+            rep(f'      ... and {len(worst) - 12} more')
+    same &= not moved
+
+    # Totals across every ROI. Hierarchical ROIs overlap, so this does NOT
+    # equal Meta.totalPreCount and is not meant to -- it is a single number
+    # that moves when anything underneath it does.
+    ta = (sum(v[0] for v in da.values()), sum(v[1] for v in da.values()))
+    tb = (sum(v[0] for v in db.values()), sum(v[1] for v in db.values()))
+    same &= row(rep, 'summed over all ROIs (pre)', ta[0], tb[0], cat='roiInfo')
+    same &= row(rep, 'summed over all ROIs (post)', ta[1], tb[1], cat='roiInfo')
+    return same
+
+
+def pcts(delta, base):
+    """A signed percentage, or '--' when there is no base to divide by."""
+    if not base:
+        return '--'
+    return f'{100.0 * delta / base:+.1f}%'
+
+
 def layer_indexes(a, b, rep):
     """Index INVENTORY, not index usage.  See the module docstring."""
     rep('\n--- index inventory ---')
@@ -1748,6 +1870,11 @@ def main(argv):
     p.add_argument('--no-indexes', action='store_true')
     p.add_argument('--no-config', action='store_true')
     p.add_argument('--no-connectivity', action='store_true')
+    p.add_argument(
+        '--no-roiinfo', action='store_true',
+        help='skip the per-ROI roiInfo rollup. It parses every Segment\'s '
+             'roiInfo server-side, which is the slowest query in the data '
+             'layer on a large dataset.')
     p.add_argument('--sample', type=int, default=25, metavar='N',
                    help='bodies to sample for the connectivity comparison '
                         '(default 25; chosen from bodyIds present on both). '
@@ -1848,7 +1975,9 @@ def main(argv):
                          'complete" below'))
         args.no_indexes = args.no_endpoints = args.no_timing = True
         args.no_config = args.no_connectivity = True
+        args.no_roiinfo = True
 
+    roiinfo_same = True if args.no_roiinfo else layer_roiinfo(a, b, rep)
     conn_same = True if args.no_connectivity else layer_connectivity(
         a, b, args.sample, rep)
     index_same = True if args.no_indexes else layer_indexes(a, b, rep)
@@ -1869,6 +1998,8 @@ def main(argv):
 
     rep('\n=== summary ===')
     for name, enabled, good in (('data', True, data_same),
+                                ('roiInfo per ROI',
+                                 not args.no_roiinfo, roiinfo_same),
                                 ('connectivity sample',
                                  not args.no_connectivity, conn_same),
                                 ('index inventory', not args.no_indexes,
