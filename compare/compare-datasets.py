@@ -1021,6 +1021,92 @@ def row(rep, label, va, vb, note='', cat='data'):
     return same
 
 
+# One component of a lastDatabaseEdit: a timestamp, optional fractional
+# seconds, optional timezone, and an optional trailing annotation such as
+# "(segment property update)".
+EDIT_PART_RE = re.compile(
+    r'^\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})'     # to the second
+    r'(?:\.\d+)?'                                        # fractional seconds
+    r'(Z|[+-]\d{2}:?\d{2})?'                             # timezone offset
+    r'\s*(.*?)\s*$')                                     # annotation
+
+
+def normalize_edit(s):
+    """A lastDatabaseEdit with ONLY the noise removed.
+
+    Drops fractional seconds, which are an artifact of how each build wrote
+    the field and differ between two runs of the same pipeline.  Keeps the
+    timezone, which is meaningful, and keeps every appended update, which is
+    the part that matters -- see compare_edit_history.
+    """
+    if s is None or str(s) == '':
+        return ''
+    out = []
+    for part in str(s).split(' / '):
+        mo = EDIT_PART_RE.match(part)
+        if not mo:
+            out.append(part.strip())
+            continue
+        stamp, tz, note = mo.group(1), mo.group(2) or '', mo.group(3)
+        out.append(f'{stamp}{tz} {note}'.strip())
+    return ' / '.join(out)
+
+
+def edit_head(s):
+    """The first timestamp, to second precision, for the side-by-side column."""
+    return normalize_edit(s).split(' / ')[0][:19] if s else '--'
+
+
+def compare_edit_history(rep, va, vb):
+    """Compare lastDatabaseEdit on its whole normalized form; display it short.
+
+    This field is not a single timestamp.  A store that has had updates
+    applied after its build carries them appended:
+
+        2026-11-04 22:42:42.207467481-05:00 / 2026-11-05T11:15:52-05:00 (segment property update)
+
+    The field used to be truncated to 19 characters to drop sub-second
+    precision -- which also dropped that history, so two stores with different
+    update histories printed as identical.  Found on yakuba 2026-11-05, on a
+    run where the suffix was the leading candidate explanation for the only
+    structural difference in the report.
+
+    Normalizing instead of truncating keeps both properties: fractional
+    seconds still do not register (they are an artifact of how each build
+    wrote the field), and an appended update does.
+
+    An appended update is NOT evidence that the node set reflects it: a
+    property update rewrites existing nodes and creates none, so this field
+    can claim an edit the data does not contain.
+
+    Whenever the two differ, both raw strings are printed in full.  The
+    compacted column cannot show where two histories diverge, and a line that
+    says "differs" above two identical-looking values is worse than no line.
+    """
+    sa = '' if va is None else str(va)
+    sb = '' if vb is None else str(vb)
+    same = normalize_edit(sa) == normalize_edit(sb)
+
+    # Columns stay 19 wide so the table keeps its alignment; the appended
+    # history goes in the trailing note, where it cannot push anything out.
+    na = len(sa.split(' / ')) - 1 if sa else 0
+    nb = len(sb.split(' / ')) - 1 if sb else 0
+    note = ''
+    if na or nb:
+        note = (f'   ({na} appended update(s), both sides)' if na == nb
+                else f'   ({na} vs {nb} appended updates)')
+
+    mark = '' if same else rep.s.red('   <-- differs')
+    if not same:
+        rep.diff(f'meta / lastDatabaseEdit: {edit_head(sa)} vs {edit_head(sb)}')
+    rep(f'  {"lastDatabaseEdit":<24} {edit_head(sa):>20} '
+        f'{edit_head(sb):>20}{mark}{note}')
+    if not same:
+        rep(rep.s.dim(f'      A: {sa or "--"}'))
+        rep(rep.s.dim(f'      B: {sb or "--"}'))
+    return same
+
+
 def check_baseline_applies(a, b, rep):
     """Drop the baseline when the two stores are not the same source data.
 
@@ -1104,7 +1190,10 @@ def layer_data(a, b, rep):
         if name == 'uuid':
             va, vb = str(va)[:12] + '...', str(vb)[:12] + '...'
         if name == 'lastDatabaseEdit':
-            va, vb = str(va)[:19], str(vb)[:19]
+            # Compared on its whole normalized form -- the appended update
+            # history is semantic, and truncating it hid a real difference.
+            same &= compare_edit_history(rep, va, vb)
+            continue
         same &= row(rep, name, va, vb, cat='meta')
 
     rep('\n  node counts')
