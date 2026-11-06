@@ -1197,7 +1197,7 @@ def layer_data(a, b, rep):
 
     rep('\n  :Meta')
     meta_q = ('MATCH (m:Meta) RETURN m.uuid, m.lastDatabaseEdit, '
-              'm.totalPreCount, m.totalPostCount')
+              'm.latestMutationId, m.totalPreCount, m.totalPostCount')
     ma, ea = a.cypher(meta_q)
     mb, eb = b.cypher(meta_q)
     if ea or eb:
@@ -1205,10 +1205,12 @@ def layer_data(a, b, rep):
         rep.fatal(f'cannot read :Meta from '
                   f'{a.label if ea else b.label} -- {ea or eb}')
         return False
-    ma = (ma or [[None] * 4])[0]
-    mb = (mb or [[None] * 4])[0]
-    for i, name in enumerate(['uuid', 'lastDatabaseEdit',
+    ma = (ma or [[None] * 5])[0]
+    mb = (mb or [[None] * 5])[0]
+    for i, name in enumerate(['uuid', 'lastDatabaseEdit', 'latestMutationId',
                               'totalPreCount', 'totalPostCount']):
+        if name == 'latestMutationId' and ma[i] is None and mb[i] is None:
+            continue
         va, vb = ma[i], mb[i]
         if name == 'uuid':
             va, vb = str(va)[:12] + '...', str(vb)[:12] + '...'
@@ -1218,6 +1220,9 @@ def layer_data(a, b, rep):
             same &= compare_edit_history(rep, va, vb)
             continue
         same &= row(rep, name, va, vb, cat='meta')
+
+    # What uuid and latestMutationId license TOGETHER -- see the function.
+    report_source_state(rep, ma[0], mb[0], ma[2], mb[2])
 
     rep('\n  node counts')
     for label in ['Segment', 'Neuron', 'Synapse', 'SynapseSet']:
@@ -1385,6 +1390,68 @@ def pcts(delta, base):
     if not base:
         return '--'
     return f'{100.0 * delta / base:+.1f}%'
+
+
+def report_source_state(rep, uuid_a, uuid_b, mut_a, mut_b):
+    """Say what Meta.uuid and Meta.latestMutationId together license.
+
+    uuid names a DVID node.  latestMutationId is DVID's monotonic counter over
+    segmentation mutations, so it records the STATE that node was in when each
+    store was built.  Together they answer a question neither answers alone:
+    did these two stores read the same segmentation?
+
+    This matters because an UNLOCKED DVID node keeps being written to under
+    its own name, so a shared uuid does not mean a shared read.  On yakuba
+    2026-11-05 both stores reported uuid 5572acf8fd5d and the CalVer store had
+    ten more Segments; the uuid alone could not distinguish read timing from a
+    defect, and settling it took a DVID call and a body-by-body diff.  A
+    mutation id answers it here, in the first section, with no new dependency.
+
+    The reading that earns this its place is the NEGATIVE one: matching
+    mutation ids mean a structural difference CANNOT be read timing, so a node
+    count or connectivity difference is real and should be chased rather than
+    waved at drift.  Verified on wasp3, where both stores read 1000342155 and
+    every ROI total still differed -- which placed that squarely on the
+    pipeline rather than on the source data.
+    """
+    if mut_a is None and mut_b is None:
+        return True                      # neither store records it
+    if mut_a is None or mut_b is None:
+        side = 'A' if mut_a is None else 'B'
+        rep(rep.s.dim(f'      {side} records no latestMutationId -- '
+                      'segmentation state cannot be compared'))
+        rep.warn('meta / latestMutationId: present on one side only, so '
+                 'segmentation state was not compared')
+        return True
+
+    if str(uuid_a) != str(uuid_b):
+        # The uuid mismatch is the headline; the mutation id adds nothing.
+        return True
+
+    if str(mut_a) == str(mut_b):
+        rep(rep.s.dim(
+            '      same uuid AND same latestMutationId -- both stores read '
+            'the same segmentation.\n'
+            '      A node-count or connectivity difference here is NOT read '
+            'timing; it is real.'))
+        return True
+
+    delta = ''
+    try:
+        delta = f', {int(mut_b) - int(mut_a):+d}'
+    except (TypeError, ValueError):
+        pass
+    rep(rep.s.yellow(
+        f'      same uuid but latestMutationId DIFFERS{delta} -- the '
+        'segmentation moved between these builds.'))
+    rep(rep.s.dim(
+        '      Expected where a store pins to an unlocked DVID node. '
+        'Structural differences\n'
+        '      below may be read timing rather than defects -- check whether '
+        'the extra bodies\n'
+        '      are inert before chasing them. Build both sides from a locked '
+        'uuid to remove this.'))
+    return True
 
 
 def layer_indexes(a, b, rep):
