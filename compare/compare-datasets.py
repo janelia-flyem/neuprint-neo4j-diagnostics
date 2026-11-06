@@ -33,8 +33,17 @@ directory.  Needs apptainer, so run it where the snapshot lives.
 What it compares, in three layers:
 
   DATA      :Meta provenance, node counts per label, how many Neurons carry
-            each searched annotation property, and type-level differences.
+            each searched annotation property, type-level differences, and
+            per-ROI synapse totals summed out of every Segment's roiInfo.
             This is the original comparison.
+
+            roiInfo earns its place here because it is the one body of data
+            a store can disagree on while every other data check passes:
+            counts, types and sampled connectivity can all match exactly
+            while every ROI figure a user sees is different.  It is also
+            stored rather than computed -- written as a JSON string at CSV
+            import -- so a difference in it is always the pipeline that
+            built the CSVs, never the server that serves them.
 
   FUNCTION  Every read-only neuPrintHTTP endpoint the client actually calls,
             invoked on both instances with identical inputs and the responses
@@ -1012,6 +1021,92 @@ def row(rep, label, va, vb, note='', cat='data'):
     return same
 
 
+# One component of a lastDatabaseEdit: a timestamp, optional fractional
+# seconds, optional timezone, and an optional trailing annotation such as
+# "(segment property update)".
+EDIT_PART_RE = re.compile(
+    r'^\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})'     # to the second
+    r'(?:\.\d+)?'                                        # fractional seconds
+    r'(Z|[+-]\d{2}:?\d{2})?'                             # timezone offset
+    r'\s*(.*?)\s*$')                                     # annotation
+
+
+def normalize_edit(s):
+    """A lastDatabaseEdit with ONLY the noise removed.
+
+    Drops fractional seconds, which are an artifact of how each build wrote
+    the field and differ between two runs of the same pipeline.  Keeps the
+    timezone, which is meaningful, and keeps every appended update, which is
+    the part that matters -- see compare_edit_history.
+    """
+    if s is None or str(s) == '':
+        return ''
+    out = []
+    for part in str(s).split(' / '):
+        mo = EDIT_PART_RE.match(part)
+        if not mo:
+            out.append(part.strip())
+            continue
+        stamp, tz, note = mo.group(1), mo.group(2) or '', mo.group(3)
+        out.append(f'{stamp}{tz} {note}'.strip())
+    return ' / '.join(out)
+
+
+def edit_head(s):
+    """The first timestamp, to second precision, for the side-by-side column."""
+    return normalize_edit(s).split(' / ')[0][:19] if s else '--'
+
+
+def compare_edit_history(rep, va, vb):
+    """Compare lastDatabaseEdit on its whole normalized form; display it short.
+
+    This field is not a single timestamp.  A store that has had updates
+    applied after its build carries them appended:
+
+        2026-11-04 22:42:42.207467481-05:00 / 2026-11-05T11:15:52-05:00 (segment property update)
+
+    The field used to be truncated to 19 characters to drop sub-second
+    precision -- which also dropped that history, so two stores with different
+    update histories printed as identical.  Found on yakuba 2026-11-05, on a
+    run where the suffix was the leading candidate explanation for the only
+    structural difference in the report.
+
+    Normalizing instead of truncating keeps both properties: fractional
+    seconds still do not register (they are an artifact of how each build
+    wrote the field), and an appended update does.
+
+    An appended update is NOT evidence that the node set reflects it: a
+    property update rewrites existing nodes and creates none, so this field
+    can claim an edit the data does not contain.
+
+    Whenever the two differ, both raw strings are printed in full.  The
+    compacted column cannot show where two histories diverge, and a line that
+    says "differs" above two identical-looking values is worse than no line.
+    """
+    sa = '' if va is None else str(va)
+    sb = '' if vb is None else str(vb)
+    same = normalize_edit(sa) == normalize_edit(sb)
+
+    # Columns stay 19 wide so the table keeps its alignment; the appended
+    # history goes in the trailing note, where it cannot push anything out.
+    na = len(sa.split(' / ')) - 1 if sa else 0
+    nb = len(sb.split(' / ')) - 1 if sb else 0
+    note = ''
+    if na or nb:
+        note = (f'   ({na} appended update(s), both sides)' if na == nb
+                else f'   ({na} vs {nb} appended updates)')
+
+    mark = '' if same else rep.s.red('   <-- differs')
+    if not same:
+        rep.diff(f'meta / lastDatabaseEdit: {edit_head(sa)} vs {edit_head(sb)}')
+    rep(f'  {"lastDatabaseEdit":<24} {edit_head(sa):>20} '
+        f'{edit_head(sb):>20}{mark}{note}')
+    if not same:
+        rep(rep.s.dim(f'      A: {sa or "--"}'))
+        rep(rep.s.dim(f'      B: {sb or "--"}'))
+    return same
+
+
 def check_baseline_applies(a, b, rep):
     """Drop the baseline when the two stores are not the same source data.
 
@@ -1029,12 +1124,35 @@ def check_baseline_applies(a, b, rep):
 
     So a mismatch disables the baseline rather than warning about it: a run
     that cannot be trusted should not be able to report OK.
+
+    MATCHING uuids are necessary but NOT sufficient, and this function says so
+    rather than implying otherwise.  A uuid names a DVID node, and an UNLOCKED
+    node keeps being written to under that same name -- so two builds citing
+    one uuid read the same pointer at different times, not the same data.
+    Verified on yakuba 2026-11-05: `5572acf8fd5d` was the only unlocked node
+    of ~132 in the repo, and the nightly pins to it.  Ten real bodies (108k to
+    1.77M voxels, all present in DVID) appeared between the nightly's build
+    and a CalVer ingest the next day, with both stores reporting that uuid and
+    an identical lastDatabaseEdit.  Nothing here can detect that -- it would
+    take a DVID call -- so the run reports the limit instead of asserting a
+    guarantee it has not checked.
     """
     if not rep.baseline:
         return
     ua = a.scalar('MATCH (m:Meta) RETURN m.uuid')
     ub = b.scalar('MATCH (m:Meta) RETURN m.uuid')
     if not ua or not ub or ua == ub:
+        if ua and ub:
+            # One dim line, on every baselined run: the alternative is a
+            # reader taking "uuid matches" for "same source data", which is
+            # exactly the inference that cost a day on yakuba.
+            rep(rep.s.dim(
+                f'\n  baseline applies -- Meta.uuid matches '
+                f'({str(ua)[:12]}...). Note this means both stores cite the\n'
+                f'  same DVID node, not that they read it at the same time: an '
+                f'unlocked node keeps\n  changing under its own name. Check '
+                f'DAG.Nodes[uuid].Locked before trusting a\n  structural '
+                f'difference, or build both sides from a locked uuid.'))
         return
     rep.heading('--- baseline IGNORED ---')
     rep(f'  {rep.s.red("Meta.uuid differs")}: {str(ua)[:12]}... vs '
@@ -1095,7 +1213,10 @@ def layer_data(a, b, rep):
         if name == 'uuid':
             va, vb = str(va)[:12] + '...', str(vb)[:12] + '...'
         if name == 'lastDatabaseEdit':
-            va, vb = str(va)[:19], str(vb)[:19]
+            # Compared in full -- the appended update history is semantic,
+            # and truncating it hid a real difference.  See the function.
+            same &= compare_edit_history(rep, va, vb)
+            continue
         same &= row(rep, name, va, vb, cat='meta')
 
     rep('\n  node counts')
@@ -1151,6 +1272,119 @@ def layer_data(a, b, rep):
         rep(f'      ... and {len(moved) - 12} more')
     same &= not (only_a or only_b or moved)
     return same
+
+
+ROIINFO_Q = (
+    'MATCH (n:Segment) WHERE n.roiInfo IS NOT NULL '
+    'WITH apoc.convert.fromJsonMap(n.roiInfo) AS m '
+    'UNWIND keys(m) AS roi '
+    'WITH roi, m[roi] AS v '
+    'RETURN roi, sum(coalesce(v.pre, 0)) AS pre, '
+    'sum(coalesce(v.post, 0)) AS post ORDER BY roi'
+)
+
+
+def layer_roiinfo(a, b, rep):
+    """Per-ROI synapse totals, summed out of every Segment's roiInfo.
+
+    roiInfo is a JSON STRING property written at CSV import.  No server
+    computes it, so a difference here is never a Neo4j difference -- it comes
+    from the pipeline run that produced the CSVs.  That is exactly why it
+    belongs in the data layer: it is data, and reporting it among the
+    endpoints invites the wrong conclusion.
+
+    Without this check a store can pass every other data comparison -- node
+    counts, types, sampled connectivity edge-by-edge, index inventory -- and
+    still disagree on every ROI figure a user can see.  Observed on wasp3
+    2026-11-04: all 95 ROIs differed while the data layer reported identical,
+    because two different Phase 1 runs assign synapses to ROIs slightly
+    differently.  Eight endpoints flagged it; none of them said "data".
+
+    The sum is done server-side, so the result is one row per ROI rather than
+    one per body.  Needs APOC for the JSON parse (apoc.convert.fromJsonMap,
+    present in APOC 3.5, 4.x and CalVer alike, and already relied on by
+    neuPrintHTTP itself).  Where it is missing the check is skipped with a
+    warning rather than failing the run -- an absent plugin is not evidence
+    that two stores disagree.
+    """
+    rep('\n--- roiInfo totals per ROI ---')
+    rep(rep.s.dim('  Summed from every Segment. Stored at import, so a '
+                  'difference here is the pipeline, not the server.'))
+
+    ra, ea = a.cypher(ROIINFO_Q)
+    rb, eb = b.cypher(ROIINFO_Q)
+    if ea or eb:
+        side = a.label if ea else b.label
+        rep(rep.s.yellow(f'  skipped -- {side}: {ea or eb}'))
+        rep.warn(f'roiInfo / not compared: {side} could not run the rollup '
+                 f'({ea or eb})')
+        return True
+
+    da = {r[0]: (r[1] or 0, r[2] or 0) for r in (ra or [])}
+    db = {r[0]: (r[1] or 0, r[2] or 0) for r in (rb or [])}
+    if not da and not db:
+        rep(rep.s.dim('  no roiInfo on either side -- nothing to compare'))
+        return True
+
+    same = row(rep, 'ROIs with roiInfo', len(da), len(db), cat='roiInfo')
+
+    only_a = sorted(set(da) - set(db))
+    only_b = sorted(set(db) - set(da))
+    for items, side in ((only_a, a.label), (only_b, b.label)):
+        count = rep.s.red(str(len(items))) if items else rep.s.green('0')
+        rep(f'  only in {side}: {count}')
+        if items:
+            # A renamed ROI lands here, not in the count comparison -- this is
+            # what a property-name change looks like from the outside.
+            rep.diff(f'roiInfo / ROIs only in {side}: {len(items)}')
+            for roi in items[:12]:
+                rep(f'      {roi}')
+            if len(items) > 12:
+                rep(f'      ... and {len(items) - 12} more')
+    same &= not (only_a or only_b)
+
+    shared = sorted(set(da) & set(db))
+    moved = [roi for roi in shared if da[roi] != db[roi]]
+    n = rep.s.red(f'{len(moved)} of {len(shared)}') if moved \
+        else rep.s.green(f'0 of {len(shared)}')
+    rep(f'  ROIs with different totals: {n}')
+    if moved:
+        rep.diff(f'roiInfo / ROIs with different synapse totals: '
+                 f'{len(moved)} of {len(shared)}')
+        # Rank by absolute movement, not alphabetically: when most of the set
+        # moves a little, what matters is which moved most.
+        worst = sorted(moved, key=lambda r: -(abs(db[r][0] - da[r][0])
+                                              + abs(db[r][1] - da[r][1])))
+        rep(rep.s.dim('      largest movers (pre, post):'))
+        for roi in worst[:12]:
+            dpre = db[roi][0] - da[roi][0]
+            dpost = db[roi][1] - da[roi][1]
+            # Percentages keep a big absolute delta on a big ROI from reading
+            # as worse than a small one that moved most of its synapses.
+            pct = ''
+            if da[roi][0] or da[roi][1]:
+                pct = (f'   ({pcts(dpre, da[roi][0])} pre, '
+                       f'{pcts(dpost, da[roi][1])} post)')
+            rep(f'      {roi:<18} pre {dpre:+d}   post {dpost:+d}{pct}')
+        if len(worst) > 12:
+            rep(f'      ... and {len(worst) - 12} more')
+    same &= not moved
+
+    # Totals across every ROI. Hierarchical ROIs overlap, so this does NOT
+    # equal Meta.totalPreCount and is not meant to -- it is a single number
+    # that moves when anything underneath it does.
+    ta = (sum(v[0] for v in da.values()), sum(v[1] for v in da.values()))
+    tb = (sum(v[0] for v in db.values()), sum(v[1] for v in db.values()))
+    same &= row(rep, 'summed over all ROIs (pre)', ta[0], tb[0], cat='roiInfo')
+    same &= row(rep, 'summed over all ROIs (post)', ta[1], tb[1], cat='roiInfo')
+    return same
+
+
+def pcts(delta, base):
+    """A signed percentage, or '--' when there is no base to divide by."""
+    if not base:
+        return '--'
+    return f'{100.0 * delta / base:+.1f}%'
 
 
 def layer_indexes(a, b, rep):
@@ -1748,6 +1982,11 @@ def main(argv):
     p.add_argument('--no-indexes', action='store_true')
     p.add_argument('--no-config', action='store_true')
     p.add_argument('--no-connectivity', action='store_true')
+    p.add_argument(
+        '--no-roiinfo', action='store_true',
+        help='skip the per-ROI roiInfo rollup. It parses every Segment\'s '
+             'roiInfo server-side, which is the slowest query in the data '
+             'layer on a large dataset.')
     p.add_argument('--sample', type=int, default=25, metavar='N',
                    help='bodies to sample for the connectivity comparison '
                         '(default 25; chosen from bodyIds present on both). '
@@ -1848,7 +2087,9 @@ def main(argv):
                          'complete" below'))
         args.no_indexes = args.no_endpoints = args.no_timing = True
         args.no_config = args.no_connectivity = True
+        args.no_roiinfo = True
 
+    roiinfo_same = True if args.no_roiinfo else layer_roiinfo(a, b, rep)
     conn_same = True if args.no_connectivity else layer_connectivity(
         a, b, args.sample, rep)
     index_same = True if args.no_indexes else layer_indexes(a, b, rep)
@@ -1869,6 +2110,8 @@ def main(argv):
 
     rep('\n=== summary ===')
     for name, enabled, good in (('data', True, data_same),
+                                ('roiInfo per ROI',
+                                 not args.no_roiinfo, roiinfo_same),
                                 ('connectivity sample',
                                  not args.no_connectivity, conn_same),
                                 ('index inventory', not args.no_indexes,
