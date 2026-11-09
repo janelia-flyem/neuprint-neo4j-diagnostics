@@ -1189,7 +1189,7 @@ def layer_identity(a, b, rep):
         rep(f'  {side}  {inst.label:<28} neuPrintHTTP {v:<10} neo4j {neo}')
 
 
-def layer_data(a, b, rep):
+def layer_data(a, b, rep, ev=None):
     """The original comparison: provenance, counts, coverage, types."""
     same = True
     rep('\n--- data ---')
@@ -1217,18 +1217,27 @@ def layer_data(a, b, rep):
         if name == 'lastDatabaseEdit':
             # Compared in full -- the appended update history is semantic,
             # and truncating it hid a real difference.  See the function.
-            same &= compare_edit_history(rep, va, vb)
+            edit_same = compare_edit_history(rep, va, vb)
+            if ev is not None:
+                ev.edit_same, ev.edit_a, ev.edit_b = edit_same, va, vb
+            same &= edit_same
             continue
         same &= row(rep, name, va, vb, cat='meta')
 
     # What uuid and latestMutationId license TOGETHER -- see the function.
     report_source_state(rep, ma[0], mb[0], ma[2], mb[2])
+    if ev is not None:
+        ev.uuid_same = str(ma[0]) == str(mb[0])
+        if ma[2] is not None and mb[2] is not None:
+            ev.mutation_same = str(ma[2]) == str(mb[2])
 
     rep('\n  node counts')
     for label in ['Segment', 'Neuron', 'Synapse', 'SynapseSet']:
         q = f'MATCH (n:{label}) RETURN count(n)'
         ca, cb = a.scalar(q, 0), b.scalar(q, 0)
         delta = f'  ({cb - ca:+d})' if ca != cb else ''
+        if ev is not None and ca != cb:
+            ev.node_moves[label] = (ca, cb)
         same &= row(rep, label, ca, f'{cb}{delta}', cat='nodes')
 
     rep('\n  Neurons carrying each searched property')
@@ -1239,6 +1248,8 @@ def layer_data(a, b, rep):
         pa, pb = pa[0], pb[0]
         for i, p in enumerate(SEARCH_PROPS):
             if pa[i] or pb[i]:
+                if ev is not None and pa[i] != pb[i]:
+                    ev.property_moves[p] = (pa[i], pb[i])
                 same &= row(rep, p, pa[i], pb[i], cat='property')
         empty = [p for i, p in enumerate(SEARCH_PROPS) if not pa[i] and not pb[i]]
         if empty:
@@ -1276,6 +1287,8 @@ def layer_data(a, b, rep):
     if len(moved) > 12:
         rep(f'      ... and {len(moved) - 12} more')
     same &= not (only_a or only_b or moved)
+    if ev is not None:
+        ev.types_only_a, ev.types_only_b = len(only_a), len(only_b)
     return same
 
 
@@ -1289,7 +1302,7 @@ ROIINFO_Q = (
 )
 
 
-def layer_roiinfo(a, b, rep):
+def layer_roiinfo(a, b, rep, ev=None):
     """Per-ROI synapse totals, summed out of every Segment's roiInfo.
 
     roiInfo is a JSON STRING property written at CSV import.  No server
@@ -1374,6 +1387,8 @@ def layer_roiinfo(a, b, rep):
         if len(worst) > 12:
             rep(f'      ... and {len(worst) - 12} more')
     same &= not moved
+    if ev is not None:
+        ev.roiinfo_same = same
 
     # Totals across every ROI. Hierarchical ROIs overlap, so this does NOT
     # equal Meta.totalPreCount and is not meant to -- it is a single number
@@ -2034,6 +2049,333 @@ def parse_endpoints(argv_rest, snapshot_opts=None):
                      'Run with --help.')
 
 
+# --------------------------------------------------------------------------
+# attribution
+# --------------------------------------------------------------------------
+#
+# Grouping findings by the evidence that explains them, so a report whose
+# differences are all expected reads as such without any of them being
+# hidden.
+#
+# This is deliberately NOT a confidence score.  There is no labelled corpus
+# of drift-versus-regression to calibrate a percentage against, so a number
+# would be a guess wearing a lab coat -- and worse, it would invite the
+# skimming that the findings roll-up exists to prevent.  The failure that
+# costs you is a real regression labelled "92% drift".
+#
+# What the run can do honestly is say which signal it measured, what that
+# signal licenses, and what it does not rule out.
+
+class Evidence:
+    """What the run observed that might explain a finding.
+
+    Filled in by the layers as they go and read once at the end.  Everything
+    stored here is an OBSERVATION; attribute() is what turns observations
+    into claims, and it names which claim rests on what.
+    """
+
+    def __init__(self):
+        self.uuid_same = None           # None means "not checked"
+        self.mutation_same = None
+        self.edit_same = None
+        self.edit_a = None
+        self.edit_b = None
+        self.roiinfo_same = None
+        self.property_moves = {}        # 'type' -> (14272, 14271)
+        self.node_moves = {}            # 'Segment' -> (22239857, 22239867)
+        self.types_only_a = 0           # type names present on one side only
+        self.types_only_b = 0
+
+    @property
+    def source_frozen(self):
+        """Both stores read the same segmentation IN THE SAME STATE.
+
+        Needs both signals. A shared uuid says they cite one DVID node; a
+        shared latestMutationId says that node had not been written to in
+        between. Either alone is insufficient -- see report_source_state.
+        """
+        return self.uuid_same is True and self.mutation_same is True
+
+    @property
+    def source_moved(self):
+        """Same node, different state: the segmentation moved underneath."""
+        return self.uuid_same is True and self.mutation_same is False
+
+    @property
+    def annotations_moved(self):
+        """The two stores fetched annotations at different times.
+
+        Annotations are read live from DVID at build time rather than pinned
+        to the uuid, so a differing lastDatabaseEdit history is direct
+        evidence of a different fetch -- and it is dated, which is why this
+        counts as explained rather than merely consistent.
+        """
+        return self.edit_same is False
+
+    @property
+    def property_direction(self):
+        """'A', 'B', 'mixed', or None -- which side carries more annotations.
+
+        Curation is additive, so if drift is the explanation every differing
+        property should move the same way. A mixed direction means something
+        other than "a curator added some" and must not be waved through.
+        """
+        ups = downs = 0
+        for va, vb in self.property_moves.values():
+            try:
+                va, vb = int(va), int(vb)
+            except (TypeError, ValueError):
+                return None
+            ups += va > vb
+            downs += vb > va
+        if ups and downs:
+            return 'mixed'
+        return 'A' if ups else ('B' if downs else None)
+
+
+# Which upstream data each endpoint reads. An endpoint difference whose
+# upstream field ALSO differs is a symptom rather than an independent
+# finding, and saying so once beats listing eight of them -- which is what
+# the wasp3 run did, where seven endpoint diffs were all roiInfo.
+ENDPOINT_READS = {
+    'dbmeta/datasets': ('meta',),
+    'cached/roiconnectivity': ('roiinfo',),
+    'cached/roicompleteness': ('roiinfo',),
+    'npexplorer/roiconnectivity': ('roiinfo',),
+    'npexplorer/completeness': ('roiinfo',),
+    'npexplorer/distribution': ('roiinfo',),
+    'npexplorer/roisinneuron': ('roiinfo',),
+    'npexplorer/simpleconnections': ('roiinfo', 'annotation'),
+    'npexplorer/findneurons': ('roiinfo', 'annotation'),
+    'npexplorer/celltype': ('annotation',),
+    'npexplorer/autapses': ('annotation',),
+    'npexplorer/neuronmeta': ('annotation',),
+    'npexplorer/neuronmetavals': ('annotation',),
+    'npexplorer/rankedtable': ('annotation',),
+    'npexplorer/commonconnectivity': ('annotation',),
+}
+
+# Unattributed first, deliberately: it is the group a reader must not skip.
+CAUSE_ORDER = [
+    'unattributed', 'segmentation-drift', 'pipeline', 'annotation-drift',
+    'server-generation', 'pre-existing', 'by-design', 'measurement',
+]
+CAUSE_TITLE = {
+    'unattributed': 'UNATTRIBUTED',
+    'segmentation-drift': 'SEGMENTATION DRIFT',
+    'pipeline': 'PIPELINE',
+    'annotation-drift': 'ANNOTATION DRIFT',
+    'server-generation': 'SERVER GENERATION',
+    'pre-existing': 'PRE-EXISTING ON BOTH SIDES',
+    'by-design': 'BY DESIGN',
+    'measurement': 'MEASUREMENT',
+}
+UNRULED = {
+    'annotation-drift':
+        'a correction rather than an addition -- this compares how many '
+        'bodies carry\n                   each property, not what the values '
+        'are.',
+    'segmentation-drift':
+        'a pipeline change that happens to coincide with the segmentation '
+        'moving.',
+    'pipeline':
+        'which pipeline difference -- a code change and a non-reproducible '
+        'run\n                   look the same from here.',
+    'pre-existing':
+        'that the defect matters. Failing on both sides makes it not a '
+        'MIGRATION\n                   finding, not a non-problem.',
+    'by-design':
+        'a real difference hiding behind a reordering -- the row sets are\n'
+        '                   compared, but only as sets.',
+}
+
+
+def attribute(text, ev):
+    """Classify one finding. Returns (cause, verdict, note).
+
+    `verdict` is 'explained' where direct, dated evidence covers the finding,
+    and 'consistent with' where only the shape matches. Anything with neither
+    stays 'unattributed', which is the default and is never reached by
+    elimination: a finding moves out of it only on a signal that was actually
+    measured.
+    """
+    key = text.split(': ', 1)[0].strip()
+    detail = text.split(': ', 1)[1] if ': ' in text else ''
+    cat, _, name = key.partition(' / ')
+
+    if cat == 'timing':
+        return 'measurement', 'explained', 'timing is a measurement, not a verdict'
+    if cat == 'encoding':
+        return 'pre-existing', 'explained', 'same behavior on both server generations'
+    if cat == 'config':
+        return 'server-generation', 'explained', '4.4 and CalVer name settings differently'
+
+    if cat == 'endpoint':
+        if 'fails on BOTH' in detail:
+            return 'pre-existing', 'explained', 'fails identically on both sides'
+        if 'different order' in detail or 'reordered' in detail:
+            return 'by-design', 'explained', 'Go map iteration order, randomized per call'
+        if name == 'cached/dailytype':
+            return 'by-design', 'explained', 'picks a type at random on every call'
+        reads = ENDPOINT_READS.get(name, ())
+        if 'roiinfo' in reads and ev.roiinfo_same is False:
+            cause = 'segmentation-drift' if ev.source_moved else 'pipeline'
+            return cause, 'explained', 'downstream of roiInfo, which differs'
+        if 'annotation' in reads and ev.annotations_moved:
+            return 'annotation-drift', 'explained', 'downstream of annotations, which differ'
+        if 'meta' in reads and ev.annotations_moved:
+            return 'annotation-drift', 'explained', 'reports Meta.lastDatabaseEdit, which differs'
+        if 'meta' in reads and ev.uuid_same is False:
+            return 'segmentation-drift', 'explained', 'reports Meta.uuid, which differs'
+        return 'unattributed', None, ''
+
+    if cat == 'roiInfo':
+        if ev.source_moved:
+            return 'segmentation-drift', 'consistent with', \
+                'the segmentation moved, so ROI membership can move with it'
+        return 'pipeline', 'explained', \
+            'roiInfo is stored at CSV import; no server computes it'
+
+    if cat == 'meta':
+        if name == 'uuid':
+            return 'segmentation-drift', 'explained', 'a different DVID node'
+        if name == 'latestMutationId':
+            return 'segmentation-drift', 'explained', 'the node was in a different state'
+        if name == 'lastDatabaseEdit':
+            return 'annotation-drift', 'explained', \
+                'this field IS the evidence -- the update histories differ'
+        if ev.source_moved:
+            return 'segmentation-drift', 'consistent with', 'the segmentation moved'
+        return 'unattributed', None, ''
+
+    if cat in ('property', 'types'):
+        if not ev.annotations_moved:
+            return 'unattributed', None, \
+                'lastDatabaseEdit matches, so build timing does not explain this'
+        if ev.property_direction == 'mixed':
+            return 'unattributed', None, \
+                'properties move in BOTH directions, which addition cannot explain'
+        if ev.source_frozen:
+            return 'annotation-drift', 'explained', ''
+        return 'annotation-drift', 'consistent with', \
+            'segmentation state was not confirmed, so bodies may have moved too'
+
+    if cat == 'nodes':
+        if ev.source_moved:
+            return 'segmentation-drift', 'explained', 'the segmentation moved between builds'
+        if ev.source_frozen:
+            return 'unattributed', None, \
+                'latestMutationId matches, so the segmentation did NOT move: ' \
+                'this is not read timing'
+        return 'unattributed', None, ''
+
+    return 'unattributed', None, ''
+
+
+def evidence_lines(cause, ev):
+    """The measured signals supporting a cause, as display lines."""
+    out = []
+    if cause == 'annotation-drift':
+        out.append('lastDatabaseEdit histories differ:')
+        out.append(f'  A: {ev.edit_a}')
+        out.append(f'  B: {ev.edit_b}')
+        if ev.source_frozen:
+            out.append('latestMutationId identical -- the segmentation did not move')
+        d = ev.property_direction
+        if d in ('A', 'B'):
+            # Counts moving one way look like pure addition. The type SETS
+            # can say otherwise: a type present only on the lower side means
+            # a body was re-typed away from it, which is a change rather than
+            # an addition. Say so -- the run has the data, and claiming
+            # "addition" while holding evidence of a reassignment is the
+            # overstatement this whole section exists to avoid.
+            lost = ev.types_only_b if d == 'A' else ev.types_only_a
+            if lost:
+                out.append(f'every differing property is higher on {d}, but '
+                           f'{lost} type(s) exist only on the other side --')
+                out.append('  at least one body was RE-typed, not newly typed')
+            else:
+                out.append(f'every differing property is higher on {d}, and no '
+                           'type exists only on the other')
+                out.append('  side -- consistent with addition alone')
+    elif cause == 'segmentation-drift':
+        if ev.uuid_same is False:
+            out.append('Meta.uuid differs -- a different DVID node entirely')
+        elif ev.mutation_same is False:
+            out.append('same uuid but latestMutationId differs -- the node was '
+                       'written to in between')
+    elif cause == 'pipeline':
+        out.append('roiInfo is a JSON string written at CSV import, so no '
+                   'server computes it')
+        if ev.source_frozen:
+            out.append('uuid and latestMutationId both match, so the source '
+                       'data was identical')
+    return out
+
+
+def layer_attribution(rep, ev):
+    """Group the findings by the evidence that explains them.
+
+    Three rules keep this from becoming a confidence score by another name:
+
+      1.  It never changes the exit code and never removes a finding from the
+          roll-up above.  It adds evidence; it does not subtract findings.
+      2.  Every group states what it could NOT rule out.
+      3.  Attribution requires positive evidence.  "No other explanation
+          comes to mind" is not evidence, so unattributed is the default and
+          is printed first.
+
+    Rule 3 is the one that matters.  The failure worth guarding against is a
+    real regression grouped under drift, and the guard is that a finding only
+    leaves UNATTRIBUTED on a signal the run actually measured -- a differing
+    mutation id, a dated edit history -- never on the absence of an
+    alternative.
+    """
+    if not rep.findings:
+        return
+    groups = {}
+    for sev, text in rep.findings:
+        cause, verdict, note = attribute(text, ev)
+        groups.setdefault((cause, verdict), []).append((sev, text, note))
+    if list(groups) == [('unattributed', None)]:
+        return                      # nothing explained: the roll-up says it all
+
+    rep('\n--- attribution ---')
+    rep(rep.s.dim('  Findings grouped by the evidence that explains them. '
+                  'This adds evidence; it\n  removes no finding above and '
+                  'changes no verdict. UNATTRIBUTED comes first.'))
+
+    # UNATTRIBUTED prints even at zero. That zero is the headline of a
+    # passing run -- "everything here is explained" -- and a group that
+    # appears only when non-empty cannot say it.
+    if not any(c == 'unattributed' for c, _ in groups):
+        rep(f"\n  {rep.s.green('UNATTRIBUTED')} (0)")
+        rep(rep.s.dim('      every finding above has measured evidence behind it'))
+
+    for cause in CAUSE_ORDER:
+        for (c, verdict), items in sorted(groups.items(), key=lambda kv: str(kv[0][1])):
+            if c != cause:
+                continue
+            head = CAUSE_TITLE[cause]
+            if verdict:
+                head += f' -- {verdict}'
+            colored = (rep.s.red(head) if cause == 'unattributed'
+                       else rep.s.yellow(head))
+            rep(f'\n  {colored} ({len(items)})')
+            for i, line in enumerate(evidence_lines(cause, ev)):
+                label = '    evidence: ' if i == 0 else '              '
+                rep(rep.s.dim(label + line))
+            unruled = UNRULED.get(cause)
+            if unruled:
+                rep(rep.s.dim(f'    NOT ruled out: {unruled}'))
+            for sev, text, note in items:
+                tag = rep.s.red('DIFF') if sev == 'DIFF' else rep.s.yellow('WARN')
+                key = text.split(': ', 1)[0].strip()
+                rep(f'      {tag}  {key}')
+                if note:
+                    rep(rep.s.dim(f'            {note}'))
+
+
 def main(argv):
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -2054,6 +2396,12 @@ def main(argv):
         help='skip the per-ROI roiInfo rollup. It parses every Segment\'s '
              'roiInfo server-side, which is the slowest query in the data '
              'layer on a large dataset.')
+    p.add_argument(
+        '--no-attribution', action='store_true',
+        help='skip the attribution section, which groups the findings by the '
+             'evidence that explains them. The findings themselves are '
+             'unaffected: attribution never removes one, never changes the '
+             'verdict, and never affects the exit code.')
     p.add_argument('--sample', type=int, default=25, metavar='N',
                    help='bodies to sample for the connectivity comparison '
                         '(default 25; chosen from bodyIds present on both). '
@@ -2144,7 +2492,9 @@ def main(argv):
 
     layer_identity(a, b, rep)
 
-    data_same = layer_data(a, b, rep)
+    # Collected by the layers as they go, read once by layer_attribution.
+    ev = Evidence()
+    data_same = layer_data(a, b, rep, ev)
 
     # If the data layer could not even read :Meta, one side is unreachable or
     # the dataset is not served there.  Calling eighteen endpoints against it
@@ -2156,7 +2506,7 @@ def main(argv):
         args.no_config = args.no_connectivity = True
         args.no_roiinfo = True
 
-    roiinfo_same = True if args.no_roiinfo else layer_roiinfo(a, b, rep)
+    roiinfo_same = True if args.no_roiinfo else layer_roiinfo(a, b, rep, ev)
     conn_same = True if args.no_connectivity else layer_connectivity(
         a, b, args.sample, rep)
     index_same = True if args.no_indexes else layer_indexes(a, b, rep)
@@ -2200,6 +2550,12 @@ def main(argv):
     # Shared, so the roll-up, the baseline and the "how to accept this"
     # hint behave identically in every tool that reports findings.
     n_diff, n_warn = rep.print_findings()
+
+    # After the roll-up on purpose: the roll-up is the authoritative list
+    # of what was found, and this is commentary on it -- never the other
+    # way round.
+    if not args.no_attribution:
+        layer_attribution(rep, ev)
 
     if rep.fatals:
         rep(f'\n--- could not complete ({len(rep.fatals)}) ---')

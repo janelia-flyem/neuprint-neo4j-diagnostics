@@ -200,6 +200,19 @@ Timing is reported — A/B interleaved, first repetition discarded, median not
 mean — but never changes the verdict. A timing comparison between two machines
 is a measurement, not a verdict.
 
+After the findings block comes an **attribution section**, which groups those
+same findings by the evidence that explains them: a differing
+`latestMutationId` means the segmentation moved, a differing
+`lastDatabaseEdit` history means the two builds fetched annotations at
+different times. It is not a confidence score — there is no labeled corpus of
+drift-versus-regression to calibrate a percentage against, and a number would
+invite the skimming the findings block exists to prevent. Three rules keep it
+honest: it never removes a finding or changes the exit code, every group says
+what it could **not** rule out, and a finding leaves `UNATTRIBUTED` only on a
+signal that was actually measured, never by elimination. `UNATTRIBUTED (0)` is
+printed even when empty, because that zero is the headline of a clean run.
+`--no-attribution` turns the section off.
+
 ### `cypher-version-diff.py` — does the Cypher language version matter?
 
 A CalVer server defaults `db.query.default_language` to `CYPHER_25`, while the
