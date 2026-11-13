@@ -283,6 +283,63 @@ testing nothing. Note neuprint-python's own test suite reads
 `NEUPRINT_JWT` and passes it to `Client()` explicitly, so one token works
 everywhere.
 
+### neuprintr
+
+`check-neuprintr.R` is the R counterpart: it calls the **real neuprintr
+functions** whose Cypher changed for Neo4j 5 — `neuprint_typeof()`,
+`neuprint_name_field()`, `neuprint_search()`, `neuprint_ids()`,
+`neuprint_get_meta()`, `neuprint_get_synapses(roi=)`,
+`neuprint_connection_table()` — against every dataset you name, and reports
+per function and per dataset.
+
+```bash
+# needs R with neuprintr and its dependencies; the point is the real package
+./client/check-neuprintr.R neuprint-pre wasp3:v0.0 --neuprintr-path ~/path/to/neuprintr
+
+# the run worth keeping: one dataset per Neo4j generation on the current fleet.
+# A bare dataset uses the first server named; server/dataset names its own.
+./client/check-neuprintr.R neuprint hemibrain:v1.2.1 hemibrain:v1.2.3 neuprint-pre/wasp3:v0.0
+
+# the same, from a pixi or conda environment that has R and neuprintr's
+# dependencies (see "Requirements"); nothing in this repo provides that
+cd ~/r-neuprintr && pixi run Rscript ~/path/to/neuprint-neo4j-diagnostics/client/check-neuprintr.R \
+    neuprint hemibrain:v1.2.1 hemibrain:v1.2.3 neuprint-pre/wasp3:v0.0 \
+    --neuprintr-path ~/path/to/neuprintr
+```
+
+The roll-up ends with `neo4j generations covered: 3.5.3, 4.4.16, 2026.08.1`.
+A run that touched only one generation gets a **WARN**, because a construct
+removed in another generation can only appear as a *difference* when both are
+in the run; the emitted-text scan is the half that still works with one.
+
+neuprintr's own test suite cannot do this job: it is pinned to hemibrain body
+ids, hemibrain cell types and a saved ROI hierarchy, so against any other
+dataset it fails for data reasons and says nothing about the Cypher. This
+script instead **discovers** a connected body, a cell type and an innervated
+ROI on each dataset, then uses those. Run across datasets on different Neo4j
+generations it produces the compatibility table directly.
+
+The same two checks per function as the Python version:
+
+- **The emitted text.** Every statement the package sends is captured by
+  tracing `neuprint_fetch_custom()` and scanned for `exists(` and
+  `apoc.meta.type(` — the two things Neo4j 5 and APOC 5 removed. This needs
+  no migrated dataset to detect.
+- **Execution.** Each function runs with the discovered arguments and must
+  return a sensible value (a `STRING`, one id, a `soma` column that is not
+  `NA`). A function that runs but finds nothing is **NO-DATA**, not OK, and
+  becomes a WARN in the roll-up: "did not fail" is trivially true when
+  nothing was asked.
+
+Verified in both directions, as a regression check has to be: neuprintr
+1.4.0 (`e74bf69`) against a 2026.08.1 dataset reports 8 of 10 functions
+broken and both constructs `EMITTED`; the fixed branch reports `OK` on 3.5.3,
+4.4.16 and 2026.08.1 with both constructs `absent`.
+
+`--neuprintr-path <checkout>` loads a checkout in place via `pkgload`, so a
+branch can be tested without installing it. Without a loadable package the
+script exits **3** and says so.
+
 ## `regression/` — did a specific fix land?
 
 Each of these pins down one defect, and each is worth keeping because the same
@@ -453,12 +510,34 @@ confident all-clear that means nothing.
 audit needs `cypher-shell`; the demo needs `podman` or `docker`; the
 `findneurons` extractor needs `node` and a neuPrintExplorer checkout.
 
-**One deliberate exception to "stdlib only":**
+**Two deliberate exceptions to "stdlib only":**
 `client/check-neuprint-python.py` needs `neuprint` importable, because its
 whole purpose is to exercise that package's real query builder rather than a
 transcription of it. Run it under an environment that has it (`pixi run -e
 test python ...`, or `PYTHONPATH=<checkout>`); without it the script exits 3
 and says so, rather than reporting a pass it never earned.
+`client/check-neuprintr.R` likewise needs R with neuprintr and its
+dependencies (plus `pkgload` if you pass `--neuprintr-path`). It exits 3 on
+the same principle. This repo deliberately does not ship that environment —
+it is a 1.7 GB R toolchain for one script — but one is quick to make with
+pixi, and everything except three packages is a prebuilt conda-forge binary:
+
+```bash
+mkdir -p ~/r-neuprintr && cd ~/r-neuprintr && pixi init --platform osx-arm64 .
+pixi add r-base r-devtools r-httr r-jsonlite r-nabor r-igraph r-pbapply r-memoise \
+    r-dplyr r-bit64 r-stringr r-tibble r-matrix r-checkmate r-magrittr r-glue r-rgl \
+    r-filehash r-digest r-plyr r-yaml r-rcpp r-progress r-codetools \
+    c-compiler cxx-compiler make pkg-config
+pixi run Rscript -e 'install.packages(c("nat.utils", "readobj"), repos = "https://cloud.r-project.org")'
+pixi run Rscript -e 'remotes::install_github(c("natverse/nat", "natverse/drvid"), upgrade = "never")'
+```
+
+`nat` comes from GitHub rather than CRAN because neuprintr's `DESCRIPTION`
+requires a development version (`>= 1.9.2.9000`) that CRAN does not carry;
+`drvid` is GitHub-only. Swap the `--platform` for `linux-64` or
+`osx-64` as needed. If you also want to regenerate neuprintr's documentation,
+add `r-roxygen2=7.3.2` — the version pinned in its `DESCRIPTION`, so a
+rebuild produces no spurious `.Rd` diffs.
 
 **Every HTTP script here reads `NEUPRINT_JWT`, falling back to
 `NEUPRINT_TOKEN`**, and uses it only in a request header — never printed, never
