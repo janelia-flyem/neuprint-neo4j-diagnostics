@@ -6,7 +6,11 @@ Verify the three Cypher fixes to neuPrintHTTP's api/cached/cached.go against
 every Neo4j generation in the fleet, by running the old and new forms of each
 query side by side on the live server.
 
-    ./verify-cached-fix.py neuprint-pre hemibrain vnc wasp3:v0.8
+    ./verify-cached-fix.py neuprint-pre                        # every dataset it serves
+    ./verify-cached-fix.py neuprint-pre hemibrain vnc wasp3:v0.8   # just these
+
+With no datasets named, the server's own /api/dbmeta/datasets decides, so the
+same command fits every server.
 
 Why: one neuPrintHTTP process serves Neo4j 3.5.3, 4.4.16 and 2026.08.1 at once,
 so a fix has to be correct on the oldest and the newest simultaneously.  This
@@ -153,13 +157,24 @@ def check(server, token, dataset, name, old_q, new_q, s):
     return False
 
 
+def served_datasets(server, token):
+    """Every dataset the server serves to this token, from /api/dbmeta/datasets.
+    Used when no datasets are named, so the check fits whatever server it is
+    pointed at instead of assuming one server's list."""
+    req = urllib.request.Request(f'{server}/api/dbmeta/datasets')
+    req.add_header('Authorization', f'Bearer {token}')
+    with urllib.request.urlopen(req, timeout=TIMEOUT,
+                                context=ssl.create_default_context()) as r:
+        return sorted(json.loads(r.read()).keys())
+
+
 def main(argv):
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('server')
     p.add_argument('datasets', nargs='*',
-                   default=['hemibrain', 'vnc', 'wasp3:v0.8'])
+                   help='datasets to check (default: every dataset the server serves)')
     add_color_argument(p)
     if len(argv) < 2:
         print(__doc__)
@@ -170,14 +185,25 @@ def main(argv):
     if not server.startswith(('http://', 'https://')):
         server = (f'https://{server}.janelia.org' if '.' not in server
                   else f'https://{server}')
-    datasets = args.datasets or ['hemibrain', 'vnc', 'wasp3:v0.8']
     token = os.environ.get('NEUPRINT_JWT') or os.environ.get('NEUPRINT_TOKEN')
     if not token:
         print('ERROR: set NEUPRINT_JWT (or NEUPRINT_TOKEN).', file=sys.stderr)
         return 2
     s = Style(want_color(args.color))
 
-    print(f'server: {server}\n')
+    datasets = args.datasets
+    if not datasets:
+        try:
+            datasets = served_datasets(server, token)
+        except Exception as e:                              # noqa: BLE001
+            print(f'ERROR: could not list datasets on {server}: {e}', file=sys.stderr)
+            return 2
+        if not datasets:
+            print(f'ERROR: {server} serves no datasets to this token.', file=sys.stderr)
+            return 2
+    print(f'server: {server}')
+    print(f'datasets: {", ".join(datasets)}'
+          + ('' if args.datasets else '   (all served; name some to narrow)') + '\n')
     ok = True
     for ds in datasets:
         ver, err = cypher(server, token, ds,

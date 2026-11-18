@@ -4,12 +4,15 @@
 # queries/, so that what gets tested is what the component actually sends
 # rather than a transcription of it.
 #
-#   ./refresh-queries.sh [path-to-neuPrintExplorer] [git-ref]
+#   ./refresh-queries.sh <path-to-neuPrintExplorer> [git-ref]
+#   NEUPRINTEXPLORER=~/src/neuPrintExplorer ./refresh-queries.sh [git-ref]
 #
-# Defaults to the local checkout at origin/master. Pass a ref to pin the
-# queries to the release you are rolling out, e.g.
+# The checkout comes from the first argument, or from NEUPRINTEXPLORER when
+# the first argument looks like a git ref (or is absent). The ref defaults to
+# origin/master; pass one to pin the queries to the release you are rolling
+# out, e.g.
 #
-#   ./refresh-queries.sh ~/Documents/workspace/Git/neuPrintExplorer v1.72.3
+#   ./refresh-queries.sh ~/src/neuPrintExplorer v1.72.3
 #
 # The queries carry placeholders that check-rollout.py substitutes:
 #   TERM    the search term, escaped for a Cypher literal
@@ -24,8 +27,23 @@ set -euo pipefail
 # Shared palette (COLOR=always|never|auto, NO_COLOR respected).
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
 
-REPO=${1:-$HOME/Documents/workspace/Git/neuPrintExplorer}
-REF=${2:-origin/master}
+if [[ $# -ge 1 && -d "$1" ]]; then
+    REPO=$1; REF=${2:-origin/master}
+elif [[ $# -ge 1 && "$1" == */* ]]; then
+    echo "${C_RED}ERROR${C_RESET}: $1 is not a directory." 1>&2
+    exit 2
+else
+    REPO=${NEUPRINTEXPLORER:-}; REF=${1:-origin/master}
+fi
+if [[ -z "${REPO}" ]]; then
+    echo "${C_RED}ERROR${C_RESET}: where is neuPrintExplorer? Pass the checkout as the first argument" 1>&2
+    echo "       or set NEUPRINTEXPLORER to it." 1>&2
+    exit 2
+fi
+if [[ ! -d "${REPO}/.git" && ! -f "${REPO}/.git" ]]; then
+    echo "${C_RED}ERROR${C_RESET}: ${REPO} is not a git checkout." 1>&2
+    exit 2
+fi
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # findneurons/ is a sibling directory in this same repo now, so the default
 # needs no absolute path. DIAGNOSTICS still overrides it if that moves.

@@ -15,6 +15,39 @@ health metrics could not answer.
 [fs]: https://github.com/janelia-flyem/flyem-snapshot
 [pr]: https://github.com/janelia-flyem/flyem-snapshot/pull/71
 
+## Running
+
+Every tool runs directly (`./compare/compare-datasets.py ...`): they are
+stdlib Python, bash and curl. [pixi](https://pixi.sh) adds a pinned
+interpreter and a memorable name for each one, and `pixi task list` is the
+menu:
+
+```bash
+pixi install                        # the default environment: python + curl, small
+pixi task list                      # one task per tool, with a one-line description
+pixi run fleet --no-meta            # any task; arguments pass through unchanged
+pixi run compare neuprint-pre wasp3:v0.8 wasp3:v0.0
+pixi run rollout neuprint-pre       # umbrella: the three checks after a neuPrintHTTP deploy
+```
+
+Task names are the verb and the thing: `fleet`, `compare`, `cypher-diff`,
+`audit-indexes`, `audit-indexes-bolt`, `demo-inert-index`, `check-explorer`,
+`check-python`, `check-r`, `refresh-queries`, `verify-cached`,
+`verify-isnull`, `compare-fastquery`, `index-coverage`, `served-vs-complete`,
+`term-loss`, `find-demo-case`, `gen-index-fix`, `extract-queries`. Each
+section below shows the task next to the direct invocation.
+
+Two more environments exist, installed only when asked for because of their
+size. `pixi install -e clients` adds neuprint-python and node, for
+`check-python` and `extract-queries`; pixi picks that environment by itself
+when you run those tasks. `pixi install -e r && pixi run setup-r` builds the
+R toolchain for `check-r` (see [Requirements](#requirements)). The two
+umbrella tasks, `rollout SERVER` and `clients SERVER "DATASET ..."`, take
+exactly the arguments shown; put `--` before anything you want passed through
+to the tools underneath. Like `&&`, an umbrella stops at the first check that
+fails, so a FAILED result names the first failing tool, not necessarily the
+only one.
+
 ## Where to look
 
 The directories follow the order you would actually use them in, from a freshly
@@ -60,9 +93,10 @@ label (1 DbHit each, so speed is independent of database size). Works on 4.4
 and 5.x/CalVer alike — no APOC, no version-specific syntax.
 
 ```bash
-./live/audit-inert-indexes.sh                               # local, default db
+./live/audit-inert-indexes.sh                               # local; finds the one user database
 CYPHER_SHELL="docker exec -i neo4j-wasp cypher-shell" ./live/audit-inert-indexes.sh
-NEO4J_DB=data ./live/audit-inert-indexes.sh
+NEO4J_DB=data ./live/audit-inert-indexes.sh                 # name it when a server has several
+pixi run audit-indexes-bolt                                 # the same, under pixi
 ```
 
 ### `audit-inert-indexes-http.sh` — the same, over HTTPS
@@ -75,6 +109,7 @@ that server in sequence.
 export NEUPRINT_JWT=<your token>
 ./live/audit-inert-indexes-http.sh https://neuprint-fish2.janelia.org fish2
 ./live/audit-inert-indexes-http.sh https://neuprint.janelia.org    # all datasets
+pixi run audit-indexes https://neuprint.janelia.org                # the same, under pixi
 ```
 
 Prefer the Bolt version if you can reach the host; this one exists because
@@ -93,8 +128,8 @@ what you lose is performance, and what you get is a clean bill of health that
 means nothing.
 
 ```bash
-./live/demo-inert-index.sh                                   # needs podman
-CLI=docker ./live/demo-inert-index.sh
+./live/demo-inert-index.sh                                   # podman or docker, whichever is on PATH
+CLI=docker ./live/demo-inert-index.sh                        # or choose
 IMAGE=docker.io/library/neo4j:4.4.16 ./live/demo-inert-index.sh
 ```
 
@@ -129,6 +164,7 @@ it is the slowest query in the data layer on a large dataset.
 ./compare/compare-datasets.py neuprint-pre:yakuba neuprint-test   # two servers
 ./compare/compare-datasets.py neuprint-pre wasp3:v0.8 wasp3:v0.0  # one server
 ./compare/compare-datasets.py neuprint-pre:yakuba neuprint-test --no-timing
+pixi run compare neuprint-pre wasp3:v0.8 wasp3:v0.0               # the same, under pixi
 ```
 
 #### Comparing a snapshot before it is copied
@@ -222,7 +258,15 @@ both and compares row sets, rather than reasoning from a changelog.
 
 ```bash
 ./compare/cypher-version-diff.py neuprint-pre wasp3:v0.0
+./compare/cypher-version-diff.py neuprint-yakuba yakuba-vnc:v0.0 "DNa02" "SNpp"   # your own terms
+pixi run cypher-diff neuprint-pre wasp3:v0.0
 ```
+
+The question only exists from Neo4j 5 on: pointed at a 4.4 dataset it says
+"nothing to compare" and exits 2 rather than reporting twelve parse errors as
+divergences. The default terms are from hemibrain and the optic lobe; a term
+that matches no row under either version is reported as "not exercised", not
+as agreement, and a run where every term comes up empty gets no verdict.
 
 ## `client/` — the two clients, against a real server
 
@@ -239,8 +283,10 @@ than a transcription of it.
 
 ```bash
 export NEUPRINT_JWT=<your token>
-./client/refresh-queries.sh ~/path/to/neuPrintExplorer v1.72.3
+./client/refresh-queries.sh ~/path/to/neuPrintExplorer v1.72.3    # or NEUPRINTEXPLORER=~/path/to/neuPrintExplorer
 ./client/check-rollout.py neuprint-pre
+pixi run refresh-queries ~/path/to/neuPrintExplorer v1.72.3       # the same, under pixi
+pixi run check-explorer neuprint-pre
 ```
 
 Full documentation: [`client/README.md`](client/README.md).
@@ -258,8 +304,13 @@ would keep passing if `NeuronCriteria` changed underneath it. This one tests
 what the installed package actually emits.
 
 ```bash
-# needs `neuprint` importable -- it exercises the real code, not a copy
-pixi run -e test python client/check-neuprint-python.py neuprint-pre
+# needs `neuprint` importable -- it exercises the real code, not a copy.
+# Under pixi the `clients` environment provides the released package:
+pixi install -e clients
+pixi run check-python neuprint-pre
+# To test a checkout or branch instead, put it first on PYTHONPATH; it wins
+# over the installed package, under pixi or not:
+PYTHONPATH=~/path/to/neuprint-python pixi run check-python neuprint-pre vnc wasp3:v0.8
 PYTHONPATH=~/path/to/neuprint-python ./client/check-neuprint-python.py neuprint-pre vnc wasp3:v0.8
 ```
 
@@ -301,11 +352,12 @@ per function and per dataset.
 # A bare dataset uses the first server named; server/dataset names its own.
 ./client/check-neuprintr.R neuprint hemibrain:v1.2.1 hemibrain:v1.2.3 neuprint-pre/wasp3:v0.0
 
-# the same, from a pixi or conda environment that has R and neuprintr's
-# dependencies (see "Requirements"); nothing in this repo provides that
-cd ~/r-neuprintr && pixi run Rscript ~/path/to/neuprint-neo4j-diagnostics/client/check-neuprintr.R \
-    neuprint hemibrain:v1.2.1 hemibrain:v1.2.3 neuprint-pre/wasp3:v0.0 \
-    --neuprintr-path ~/path/to/neuprintr
+# the same, from this repo's `r` environment (see "Requirements"): R, the
+# dependency stack and neuprintr itself, so --neuprintr-path is only needed
+# to test a checkout
+pixi install -e r && pixi run setup-r            # once
+pixi run check-r neuprint hemibrain:v1.2.1 hemibrain:v1.2.3 neuprint-pre/wasp3:v0.0
+pixi run check-r neuprint-pre wasp3:v0.0 --neuprintr-path ~/path/to/neuprintr
 ```
 
 The roll-up ends with `neo4j generations covered: 3.5.3, 4.4.16, 2026.08.1`.
@@ -360,6 +412,7 @@ export NEUPRINT_JWT=<your token>
 ./fleet/fleet-status.py --baseline fleet/baseline.txt      # accept known, intended differences
 ./fleet/fleet-status.py --no-report                        # terminal only, nothing under results/
 ./fleet/fleet-status.py --manager HOST --probe-node HOST --user NAME     # override the defaults
+pixi run fleet --no-meta                                   # any of the above, under pixi
 ```
 
 `--color` and `--baseline` work as in every other tool here (see `common/`).
@@ -531,6 +584,10 @@ export NEUPRINT_JWT=<your token>
 ./regression/verify-cached-fix.py neuprint-pre
 ./regression/verify-isnull-compat.py neuprint-pre
 LIST_ONLY=1 ./regression/compare-fastquery-forms.sh
+pixi run verify-cached neuprint-pre                        # the same three, under pixi
+pixi run verify-isnull neuprint-pre
+LIST_ONLY=1 pixi run compare-fastquery
+pixi run rollout neuprint-pre                              # check-explorer + both verify-* in one go
 ```
 
 [http96]: https://github.com/connectome-neuprint/neuPrintHTTP/pull/96
@@ -546,7 +603,9 @@ missing silently.
 
 These measure that: index coverage per dataset, rows a user actually receives
 versus the complete set, and the remediation DDL. See
-[`findneurons/README.md`](findneurons/README.md).
+[`findneurons/README.md`](findneurons/README.md). Under pixi they are
+`extract-queries`, `index-coverage`, `served-vs-complete`, `term-loss`,
+`find-demo-case` and `gen-index-fix`.
 
 ## What these found
 
@@ -676,35 +735,34 @@ confident all-clear that means nothing.
 `bash`, `python3` (stdlib only), and `curl` for the HTTP scripts. The Bolt
 audit needs `cypher-shell`; the demo needs `podman` or `docker`; the
 `findneurons` extractor needs `node` and a neuPrintExplorer checkout.
+`pixi.toml` provides the Python, curl and node, in three environments, for
+`osx-arm64` and `linux-64`; it deliberately does not provide `cypher-shell`,
+`docker` or ssh keys.
+
+| environment | adds | for |
+|---|---|---|
+| `default` | `python`, `curl` | everything except the two client checks and the extractor |
+| `clients` | `neuprint-python` (from the `flyem-forge` channel), `nodejs` | `check-python`, `extract-queries` |
+| `r` | `r-base` and neuprintr's dependency stack from conda-forge, plus compilers | `check-r`; `pixi run setup-r` finishes it |
 
 **Two deliberate exceptions to "stdlib only":**
 `client/check-neuprint-python.py` needs `neuprint` importable, because its
 whole purpose is to exercise that package's real query builder rather than a
-transcription of it. Run it under an environment that has it (`pixi run -e
-test python ...`, or `PYTHONPATH=<checkout>`); without it the script exits 3
-and says so, rather than reporting a pass it never earned.
+transcription of it. The `clients` environment provides the released
+package, and `PYTHONPATH=<checkout>` in front of either invocation tests a
+branch instead; without the package the script exits 3 and says so, rather
+than reporting a pass it never earned.
 `client/check-neuprintr.R` likewise needs R with neuprintr and its
 dependencies (plus `pkgload` if you pass `--neuprintr-path`). It exits 3 on
-the same principle. This repo deliberately does not ship that environment —
-it is a 1.7 GB R toolchain for one script — but one is quick to make with
-pixi, and everything except three packages is a prebuilt conda-forge binary:
-
-```bash
-mkdir -p ~/r-neuprintr && cd ~/r-neuprintr && pixi init --platform osx-arm64 .
-pixi add r-base r-devtools r-httr r-jsonlite r-nabor r-igraph r-pbapply r-memoise \
-    r-dplyr r-bit64 r-stringr r-tibble r-matrix r-checkmate r-magrittr r-glue r-rgl \
-    r-filehash r-digest r-plyr r-yaml r-rcpp r-progress r-codetools \
-    c-compiler cxx-compiler make pkg-config
-pixi run Rscript -e 'install.packages(c("nat.utils", "readobj"), repos = "https://cloud.r-project.org")'
-pixi run Rscript -e 'remotes::install_github(c("natverse/nat", "natverse/drvid"), upgrade = "never")'
-```
-
-`nat` comes from GitHub rather than CRAN because neuprintr's `DESCRIPTION`
-requires a development version (`>= 1.9.2.9000`) that CRAN does not carry;
-`drvid` is GitHub-only. Swap the `--platform` for `linux-64` or
-`osx-64` as needed. If you also want to regenerate neuprintr's documentation,
-add `r-roxygen2=7.3.2` — the version pinned in its `DESCRIPTION`, so a
-rebuild produces no spurious `.Rd` diffs.
+the same principle. The `r` environment is 1.7 GB for one script, which is
+why it is opt-in: `pixi install -e r` fetches everything conda-forge carries
+as prebuilt binaries, and `pixi run setup-r` then installs the three packages
+it cannot: `nat` from GitHub, because neuprintr's `DESCRIPTION` requires a
+development version (`>= 1.9.2.9000`) that CRAN does not carry; `drvid`,
+which is GitHub-only; and `neuprintr` itself, so that `check-r` works without
+`--neuprintr-path`. If you also want to regenerate neuprintr's documentation,
+add `r-roxygen2=7.3.2` to the `r` feature — the version pinned in its
+`DESCRIPTION`, so a rebuild produces no spurious `.Rd` diffs.
 
 **Every HTTP script here reads `NEUPRINT_JWT`, falling back to
 `NEUPRINT_TOKEN`**, and uses it only in a request header — never printed, never

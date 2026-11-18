@@ -12,9 +12,15 @@
 # syntax, nothing written.
 #
 # Usage:
-#   ./audit-inert-indexes.sh                         # local, default db
+#   ./audit-inert-indexes.sh                         # local; the server's one user database
 #   CYPHER_SHELL="docker exec -i neo4j-wasp cypher-shell" ./audit-inert-indexes.sh
-#   NEO4J_DB=data ./audit-inert-indexes.sh
+#   NEO4J_DB=data ./audit-inert-indexes.sh           # name it when there are several
+#
+# Which database: NEO4J_DB if set; otherwise SHOW DATABASES is asked and the
+# single non-system database is used. The stores in this fleet are all named
+# `data`, not `neo4j`, and auditing an empty `neo4j` database would report
+# "nothing to audit" -- a clean result that means nothing. With more than one
+# user database the script stops and asks for NEO4J_DB.
 #
 set -uo pipefail
 
@@ -22,11 +28,30 @@ set -uo pipefail
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
 
 CS=${CYPHER_SHELL:-cypher-shell}
-DB=${NEO4J_DB:-neo4j}
-# stdin is redirected from /dev/null: CYPHER_SHELL may be a `docker exec -i`
-# wrapper, and without this it would consume the loop's input below, leaving
-# one line processed and every count wrong.
-q() { ${CS} -d "${DB}" --format plain "$1" < /dev/null 2>/dev/null | tail -n +2 | tr -d '"'; }
+DB=${NEO4J_DB:-}
+if [[ -z "${DB}" ]]; then
+    # One line per user database, or nothing if cypher-shell cannot connect.
+    DBS=$(printf '%s\n' "SHOW DATABASES YIELD name WHERE name <> 'system' RETURN DISTINCT name" \
+            | ${CS} -d system --format plain 2>/dev/null | tail -n +2 | tr -d '"' | sed '/^$/d')
+    NDB=$(printf '%s' "${DBS}" | grep -c .)
+    if [[ "${NDB}" -eq 1 ]]; then
+        DB=${DBS}
+    elif [[ "${NDB}" -gt 1 ]]; then
+        echo "ERROR: ${NDB} user databases ($(echo "${DBS}" | paste -sd, -)); set NEO4J_DB to pick one" 1>&2
+        exit 2
+    else
+        echo "ERROR: could not list databases via: ${CS}" 1>&2
+        echo "       set CYPHER_SHELL and/or NEO4J_DB (see the header of this script)" 1>&2
+        exit 2
+    fi
+fi
+# The query goes to cypher-shell on stdin, not as an argument: CYPHER_SHELL may
+# be a `docker exec -i` or `ssh` wrapper, and a wrapper that rebuilds its
+# command line would split a quoted query into words (an ssh wrapper turns the
+# `<>` in a WHERE into a redirection). The pipe is also what keeps a `-i`
+# wrapper from swallowing the loop's input below, which would leave one line
+# processed and every count wrong.
+q() { printf '%s\n' "$1" | ${CS} -d "${DB}" --format plain 2>/dev/null | tail -n +2 | tr -d '"'; }
 
 if ! q "RETURN 1;" | grep -q 1; then
     echo "ERROR: cannot query database '${DB}' via: ${CS}" 1>&2

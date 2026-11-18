@@ -4,3 +4,6 @@ __pycache__/
 # Timestamped tool output. Evidence, not source -- and this repo is public,
 # so reports naming internal hosts and dataset statistics stay local.
 results/
+
+# pixi environments
+.pixi/
