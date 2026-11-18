@@ -133,14 +133,16 @@ def load_baseline(path):
         endpoint / skeletons/skeleton[11005]: failed on neuprint-pre:wasp3:v0.0 only
 
     and the tail names instances that change between runs, so the pattern to
-    write is the part before the colon:
+    write is the part up to and including the colon:
 
-        endpoint / skeletons/skeleton[11005]
+        endpoint / skeletons/skeleton[11005]:
 
-    Shortening a pattern widens it, which is occasionally what you want: the
-    `[11005]` is one sampled body of several, and dropping it accepts the
-    endpoint for every body rather than that one. Drop it deliberately, not
-    by habit.
+    The colon matters when one key is a prefix of another: without it,
+    `config / neuprinthttp-fish2` also accepts every finding about
+    `neuprinthttp-fish2-test`. Shortening a pattern widens it, which is
+    occasionally what you want: the `[11005]` is one sampled body of several,
+    and dropping it accepts the endpoint for every body rather than that one.
+    Drop it deliberately, not by habit.
 
     Returns a list of patterns, empty if path is None.
     """
@@ -267,8 +269,11 @@ class Reporter:
                     # bare ':' truncates inside dataset names like
                     # 'yakuba-vnc:v0.0', which collapsed two distinct
                     # findings into one ambiguous key.
+                    # The colon is kept so that the suggested pattern
+                    # matches this key only, not every key it is a prefix
+                    # of (`neo4j-fish2` vs `neo4j-fish2-v0_7`).
                     key = text.split(': ', 1)[0].strip()
-                    self(self.s.dim(f'      {key}'))
+                    self(self.s.dim(f'      {key}:'))
 
         if self.accepted:
             self(f'\n--- accepted differences ({len(self.accepted)}) ---')

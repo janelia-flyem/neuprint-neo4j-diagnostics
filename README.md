@@ -27,6 +27,7 @@ built snapshot through to a server users are hitting.
 | 3. Live, one instance | Is this running server healthy and correct? | [`live/`](live/) |
 | 4. Live, two instances | Are these two servers equivalent? | [`compare/`](compare/) |
 | 5. Clients | Does neuPrintExplorer work against them? Does neuprint-python? | [`client/`](client/) |
+| — | Which dataset is on which service, on which host, and does everything agree? | [`fleet/`](fleet/) |
 | — | Did a specific fix land, and does it stay landed? | [`regression/`](regression/) |
 | — | Why is neuron search returning too few rows? | [`findneurons/`](findneurons/) |
 | — | Shared palette and report plumbing, not a tool | [`common/`](common/) |
@@ -339,6 +340,172 @@ broken and both constructs `EMITTED`; the fixed branch reports `OK` on 3.5.3,
 `--neuprintr-path <checkout>` loads a checkout in place via `pkgload`, so a
 branch can be tested without installing it. Without a loadable package the
 script exits **3** and says so.
+
+## `fleet/` — the whole swarm, in one picture
+
+### `fleet-status.py` — which dataset is where, and does everything agree?
+
+Rebuilds the "config to neo4j service map" from the live swarm instead of by
+hand, and adds what a spreadsheet cannot hold: what each neuprinthttp instance
+serves right now, which `dataset:tag` each running neo4j actually contains and
+which public hosts expose it, when each container last started, where its
+data lives and how much memory it is allowed.
+
+```bash
+export NEUPRINT_JWT=<your token>
+./fleet/fleet-status.py                                    # full run
+./fleet/fleet-status.py --no-meta                          # skip the cypher-shell pass
+./fleet/fleet-status.py --no-endpoints                     # skip the https probes (no token needed)
+./fleet/fleet-status.py --notes-from previous-map.csv      # keep the hand-written notes
+./fleet/fleet-status.py --baseline fleet/baseline.txt      # accept known, intended differences
+./fleet/fleet-status.py --no-report                        # terminal only, nothing under results/
+./fleet/fleet-status.py --manager HOST --probe-node HOST --user NAME     # override the defaults
+```
+
+`--color` and `--baseline` work as in every other tool here (see `common/`).
+
+Needs key-based ssh as the operator account (`--user`) to the swarm manager
+(`--manager`), to the probe node (`--probe-node`) and to every node that runs
+a neuprinthttp instance; the defaults for all three are in the source. It is read-only against the
+swarm: nothing is scaled, started, stopped or written on any host. The only
+thing it creates is one short-lived `docker run --rm` container on the probe
+node per run, and it checks that node first. `--no-meta` skips the container
+entirely and finishes in about 15 seconds. The endpoint probes run in parallel,
+one thread per instance, so an unreachable endpoint costs at most one 30 s
+timeout for the whole run, not one per endpoint.
+
+It opens one ssh connection per host and reuses it for every command
+(ControlMaster, sockets in a private temp dir removed at exit). Besides saving
+handshakes, that makes a run survive a resolver hiccup: the swarm hosts
+only resolve through the site's search domain, and once that blinked
+mid-run, after the swarm and configs had been collected, leaving all
+28 Meta reads of the day to fail with "Could not resolve hostname". Now the
+name is looked up once, when the connection is made, and a command that dies
+with ssh's own exit status is retried once. If the single probe command still
+fails, the Meta pass is reported with one `probe / <node>` warning, the
+header says how many stores were read, and every store is marked "not read"
+rather than reported as a fault of the store.
+
+Four sources, each collected independently so one failing does not blank the
+others:
+
+| source | from | gives |
+|---|---|---|
+| **swarm** | `docker service ls / inspect / ps`, `docker node ls`, `docker inspect` of the running tasks, all on the manager | replicas (Up, Down 0/0, Not deployed), image tag = Neo4j version, `host.role` placement constraint, the node(s) the task is actually on and when it started, the `/data` volume, heap and page cache settings, the swarm memory limit |
+| **configs** | `/opt/conf/<instance>/conf/config.json`, read over ssh **from the node each neuprinthttp runs on** | main store (**M**) and every `mainstore-alternatives` entry (**A**), each with its `database` key if any; credentials held in memory for the Meta pass and never written |
+| **endpoints** | `https://neuprint-<x>.janelia.org/api/{version,dbmeta/database,dbmeta/datasets}` | what each instance serves, from outside |
+| **meta** | `MATCH (m:Meta) RETURN m.dataset, m.tag, m.uuid, m.hideDataSet, m.totalPreCount, m.totalPostCount` (as one pipe-joined string), via `cypher-shell` in one throwaway container on the probe node, over the swarm overlay network | `dataset:tag` per running store — the only way to tell `wasp3:v0.8` from `wasp3:v0.0`, whose uuid and lastDatabaseEdit are identical — plus hidden, uuid and synapse counts |
+
+Why configs come from the running node and not the manager: every host carries
+copies of every config directory, and some are stale. The first run found the
+idle worker holding ten `neuprinthttp-*` directories while running no
+neuprinthttp at all; those are the copies a hand edit lands in by mistake.
+
+Why Meta goes over the overlay network: the operator account has no docker
+access on one of the nodes, so `docker exec` cannot reach the stores there,
+but a container on the stack's attachable overlay can reach every service by
+VIP from any node. (By VIP, not by name: Java's URI parser rejects the
+underscore in `neo4j-manc-v1_2_3`, and the name silently falls back to
+`localhost`.)
+
+Why the probe runs on an idle worker and not the manager, and why it is one
+container rather than 28: on 2026-11-17 the manager, up for years with store
+memory configured to nearly all of the box, was failing order-6 kernel
+allocations, so every `docker run` risked `error creating veth pair: cannot
+allocate memory`. Three Meta passes that afternoon, 28 container starts each,
+hit that repeatedly, and at the end of the third the overlay sandbox on the
+manager was rebuilt and every container on the node lost overlay connectivity
+until the Docker daemon was restarted. Three things changed as a result:
+
+- **The probe node is the idle worker** (`--probe-node`): far more memory than
+  its one store needs, no allocation failure in its kernel log. The manager
+  keeps only the read-only `docker service` queries. (Not the third node: the
+  operator account cannot run docker there.)
+- **One container per run.** A single `neo4j:4.4.16` container runs
+  cypher-shell for every store from inside, four at a time: 4.4's
+  cypher-shell speaks Bolt to the 3.5, 4.4 and 2026.08.1 servers alike
+  (verified against wasp3:v0.0). A fleet of 28 stores costs one interface
+  creation instead of 28, and the pass takes seconds instead of minutes.
+  `--probe-image` overrides the image; note that the CalVer image's own
+  cypher-shell does not run on the probe node (Docker 20.10, whose default
+  seccomp profile predates the syscalls its Java needs) except with
+  `--security-opt seccomp=unconfined`, which the probe deliberately avoids.
+  The container's own time limit is sized from the store count (one
+  `CYPHER_TIMEOUT` per round of four stores, plus a minute to start), so a
+  few hung stores cannot time out the stores that did answer. If the
+  container fails to start, it is retried once; a timeout is not retried.
+  A store that is Up but has no VIP on the overlay is reported as not read
+  rather than probed by a name that cannot resolve.
+- **A pre-flight check refuses to start a container on a host that is
+  failing allocations** or is short of the right kind of memory: it reads
+  the node's `dmesg` for the last hour and `/proc/meminfo`, and refuses on
+  any allocation failure, under 32 GB `MemAvailable`, under 16 GB `MemFree`,
+  or `Committed_AS` above 1.5x `CommitLimit`. The last two are what
+  `MemAvailable` alone misses: the manager that day had well over 100 GB
+  available and still failed, because almost none of it was actually free
+  and it was committed to several times its limit. If `dmesg` is
+  unreadable, the host passes only
+  with twice the headroom on every figure. On a bad answer the Meta pass is
+  skipped with one `probe / <node> / unsafe` warning instead of probing.
+
+3.5 servers have auth enabled; their credentials come from whichever
+config.json points at them, travel inside the script on ssh's stdin, are
+piped into the container as a bash string (no argv, no temp file), and are
+handed to a shell function that sets cypher-shell's environment. At no point
+is a password an argument that `ps` on any host could show.
+
+**Verdicts.** `DIFF` is an inconsistency between two sources: a config points
+at a service that is Down or does not exist; a service is Up but no config
+references it; a service is Up but **nothing answers on bolt**, or bolt answers
+but a one-row Meta query does not finish in two minutes, so whatever it
+holds is not served; a dataset:tag is held by two running services; a
+placement constraint names one node and the task runs on another; an endpoint
+serves a dataset no store behind it holds, or fails to serve one that a store
+does hold. `WARN` is context: an endpoint unreachable from here, a config
+directory with no service, a config.json that could not be read (which also
+suspends the "unreferenced" check, since a store that config might name cannot
+be called unreferenced), stale config copies, a CalVer store named without a
+`database` key, a probe node judged unsafe, a probe container that Docker
+could not start or that did not finish in time, an Up store with no VIP on the
+overlay (so it could not be probed), a Meta read that failed for a reason
+other than bolt being down.
+
+The bolt check earned its place on the first full run: three 3.5 services
+(`neo4j-fib19`, `neo4j-hemibrain-v1_0_1`, `neo4j-hemibrain-v1_1_0`) reported
+`1/1` replicas and had been "Up" for months, yet had no process listening on
+7687 — which is why their datasets had been missing from neuprint.janelia.org
+with no error anywhere. `docker service ls` cannot see that; a bolt
+connection can.
+
+**Outputs.** `results/fleet-<stamp>.txt` is the report; `results/fleet-<stamp>.csv`
+is the spreadsheet with the original's columns (service, Status, version, node,
+M/A per instance, notes) plus columns the original could not have. A service
+that a config names but the swarm does not have still gets a row, with Status
+`Not deployed`, so a retired store keeps its place (and its note) in the sheet.
+Both files are gitignored: they name internal hosts.
+
+| column | from | why |
+|---|---|---|
+| `Status` | `docker service ls`, plus `:Meta` | `Up`, `Down (0/0)`, `Not deployed`; and `Hidden` for an Up store whose Meta has `hideDataSet=true`, which runs and is served but is not listed by neuPrintExplorer. The judge treats Hidden as Up: hiding is a choice, not a fault. |
+| `running on` | `docker service ps` | the node the task is actually on (every node, if a service has more than one task); `node` is the `host.role` placement constraint, blank when the constraint is of another kind. A mismatch is a DIFF. |
+| `since` | the running task's `Status.Timestamp` | when the container last (re)started. `neo4j-fib19` had been Up for weeks while dead on bolt; this is how long. |
+| `serves` | `Meta.dataset:tag` | what the store holds. Names lie: `neo4j-wasp` holds `wasp3:v0.8`, `neo4j-wasp-calver` holds `wasp3:v0.0`. |
+| `served by` | each endpoint's `/api/dbmeta/datasets` | the public hosts that actually expose a dataset:tag this store holds. M/A says configured, `serves` says held, this says reachable. |
+| `uuid` | `Meta.uuid` | which stores were built from the same segmentation. A uuid that is a mutable DVID head does not prove the same data (yakuba). |
+| `pre / post` | `Meta.totalPreCount / totalPostCount` | size sanity: two stores claiming the same dataset:tag should agree. |
+| `data dir` | the mount at `/data` | the named volume (or host path) the store lives in; needed before moving anything off a host. |
+| `heap`, `page cache`, `memory limit` | `NEO4J_*_memory_heap_max__size`, `NEO4J_*_memory_pagecache_size`, the swarm resource limit | configured, not measured: what the store may use, for capacity planning when consolidating hosts. Three columns so a sheet can sum them. Only the memory keys leave the host: the same Env block can carry `NEO4J_AUTH`. |
+
+When the probe container cannot run at all, or does not finish within its
+time limit, that is reported once as `probe / <node> / <image>` with the
+Docker error, and every store is marked "not read" rather than reported as a
+fault of the store.
+
+Baseline patterns suggested under the findings end in a colon, so that a
+pattern for `neo4j-fish2` does not also accept `neo4j-fish2-v0_7`.
+
+Exit 0 when consistent, 1 when any `DIFF` remains after the baseline, 2 when
+the swarm could not be queried or no token is set without `--no-endpoints`.
 
 ## `regression/` — did a specific fix land?
 
