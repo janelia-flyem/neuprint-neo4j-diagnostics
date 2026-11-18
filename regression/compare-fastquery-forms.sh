@@ -27,7 +27,7 @@
 #   LIST_ONLY=1 ./compare-fastquery-forms.sh        # plan + version survey only
 #
 # NOTE ON TOKENS: set NEUPRINT_JWT (or NEUPRINT_TOKEN), as every other script
-# here does. One token authenticates against all four servers -- they share an
+# here does. One token authenticates against every server -- they share an
 # auth backend. A server that cannot be listed is reported and skipped rather
 # than aborting the run.
 #
@@ -48,15 +48,20 @@ TERMS=${TERMS:-lc,a}
 # So datasets on the same hostname may sit on backends of different versions
 # (hemibrain:v1.2.1 is 3.5.3 while male-cns:v1.0 is 4.4.16), which is why each
 # dataset is probed for its own version rather than assumed to match its host.
+# Every public endpoint that serves a 4.4 dataset today. The comparison can
+# only run on 4.4 (the original form does not compile on 5+), so leaving one
+# of these out silently skips exactly the servers the script is for.
 SERVERS_DEFAULT="https://neuprint.janelia.org
 https://neuprint-pre.janelia.org
+https://neuprint-cns.janelia.org
+https://neuprint-fabg.janelia.org
 https://neuprint-yakuba.janelia.org
 https://neuprint-fish2.janelia.org"
 
 TOKEN=${NEUPRINT_JWT:-${NEUPRINT_TOKEN:-}}
 if [[ -z "${TOKEN}" ]]; then
     echo "${C_RED}ERROR${C_RESET}: neither NEUPRINT_JWT nor NEUPRINT_TOKEN is set." 1>&2
-    echo "  export NEUPRINT_JWT='<token>'   (one token covers all four servers)" 1>&2
+    echo "  export NEUPRINT_JWT='<token>'   (one token covers every server)" 1>&2
     exit 2
 fi
 command -v python3 > /dev/null || { echo "ERROR: python3 is required." 1>&2; exit 2; }

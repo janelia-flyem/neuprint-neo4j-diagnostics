@@ -12,13 +12,19 @@
 # SHOW INDEXES reports ONLINE at populationPercent 100.0, because an index
 # over a label no node carries is trivially fully populated.
 #
-# Needs podman (or docker -- change the CLI below). Takes about two minutes.
+# Needs podman or docker, whichever is on PATH (CLI=... to choose). Takes about
+# two minutes.
 set -euo pipefail
 
 # Shared palette (COLOR=always|never|auto, NO_COLOR respected).
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../common/colors.sh"
 
-CLI=${CLI:-podman}
+if [[ -z "${CLI:-}" ]]; then
+    if command -v podman >/dev/null 2>&1; then CLI=podman
+    elif command -v docker >/dev/null 2>&1; then CLI=docker
+    else echo "ERROR: neither podman nor docker is on PATH." 1>&2; exit 2
+    fi
+fi
 IMAGE=${IMAGE:-docker.io/library/neo4j:2026.08.1}
 NAME=${NAME:-inert-index-demo}
 NODES=${NODES:-190774}          # fish2's non-synaptic element count

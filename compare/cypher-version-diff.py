@@ -115,9 +115,27 @@ def main(argv):
     print(f'server:  {server}')
     print(f'dataset: {dataset}')
     print(f'queries: {src.read_text().strip() if src.is_file() else "unknown"}')
+
+    # `CYPHER 5` and `CYPHER 25` are language versions that exist from Neo4j 5
+    # onward. A 4.4 store knows only `CYPHER 3.5` and `CYPHER 4.4`, so pointed
+    # at one, every query below would fail to parse and the report would read
+    # as twelve divergences when the real answer is "nothing to compare here".
+    rows, _, err = cypher(server, token, dataset,
+                          'CALL dbms.components() YIELD versions RETURN versions[0]')
+    version = rows[0][0] if rows and rows[0] else None
+    print(f'neo4j:   {version or (err or "unknown")}')
     print()
+    if err:
+        print(f'ERROR: {dataset} on {server} did not answer: {err}', file=sys.stderr)
+        return 2
+    if version and not (version.startswith('5.') or version[:2] == '20'):
+        print(f'RESULT: {s.yellow("nothing to compare")} -- Neo4j {version} predates the '
+              'CYPHER 5 / CYPHER 25 language versions; this dataset will see the question')
+        print('only once it moves to a CalVer store.')
+        return 2
 
     diverged = False
+    unexercised = []
     for name in ('fast', 'slow'):
         for term in terms:
             body = fill(queries[name], term)
@@ -148,7 +166,12 @@ def main(argv):
 
             s5 = {r[0] for r in r5}
             s25 = {r[0] for r in r25}
-            if s5 == s25:
+            if s5 == s25 and not s5:
+                # Agreeing on nothing proves nothing: the term matched no row
+                # under either version, so neither query's body was exercised.
+                unexercised.append(label)
+                print(f'  {label:<28} {s.yellow("not exercised")}  (0 rows under both)')
+            elif s5 == s25:
                 print(f'  {label:<28} {s.green("identical")}  ({len(s5)} rows)   '
                       f'5: {t5:.2f}s  25: {t25:.2f}s')
             else:
@@ -161,8 +184,18 @@ def main(argv):
                     print(f'      only under CYPHER 25: {only25}')
 
     print()
+    if unexercised:
+        print(f'{s.yellow("WARN")}: {len(unexercised)} of {2 * len(terms)} comparisons matched '
+              f'nothing on {dataset}, so they tested nothing.')
+        if len(unexercised) == 2 * len(terms):
+            print('      Every term came up empty: pass terms that exist in this dataset, e.g. from')
+            print('        MATCH (n:Neuron) WHERE n.type IS NOT NULL RETURN n.type LIMIT 5')
+        print()
     if diverged:
         print(f'RESULT: {s.red("the two language versions do NOT agree")} -- see above.')
+        return 1
+    if len(unexercised) == 2 * len(terms):
+        print(f'RESULT: {s.yellow("nothing compared")} -- no term matched, so no verdict.')
         return 1
     print(f'RESULT: {s.green("identical results under CYPHER 5 and CYPHER 25.")}')
     print('The pin is then a matter of stability, not current correctness:')
