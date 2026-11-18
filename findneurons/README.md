@@ -37,6 +37,15 @@ NEUPRINT_JWT=... ./index-coverage.sh https://neuprint.janelia.org
 NEUPRINT_JWT=... ./served-vs-complete.sh https://neuprint.janelia.org a ./queries
 ```
 
+The same three under pixi, from the repo root (`pixi task list` has the rest:
+`term-loss`, `find-demo-case`, `gen-index-fix`):
+
+```bash
+pixi run extract-queries ~/src/neuPrintExplorer origin/master findneurons/queries
+pixi run index-coverage https://neuprint.janelia.org
+pixi run served-vs-complete https://neuprint.janelia.org a
+```
+
 ## AUDIT AUTHENTICATED
 
 `/api/dbmeta/datasets` returns a **different set of datasets depending on the

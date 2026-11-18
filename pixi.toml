@@ -1,0 +1,179 @@
+# pixi manifest for neuprint-neo4j-diagnostics.
+#
+# Every tool here runs directly (stdlib Python, bash, curl); this file adds
+# a pinned interpreter and memorable task names. `pixi task list` is the menu.
+#
+#   pixi install                  # default env: python + curl, small
+#   pixi run fleet --no-meta      # any task; extra arguments pass through
+#   pixi install -e clients       # adds neuprint-python and node
+#   pixi install -e r && pixi run setup-r    # the R toolchain, opt-in (large)
+#
+# Not provided, by design: cypher-shell (Bolt audit), docker/podman (demo and
+# fleet probe), and ssh keys. See README "Requirements".
+
+[workspace]
+name = "neuprint-neo4j-diagnostics"
+channels = ["conda-forge", "flyem-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+python = ">=3.11"
+curl = "*"
+
+# ---- environments -----------------------------------------------------------
+
+[feature.clients.dependencies]
+# check-python exercises the real NeuronCriteria. The released package is the
+# default; PYTHONPATH=<checkout> in front of `pixi run` tests a branch instead.
+neuprint-python = "*"
+# extract-queries reads neuPrintExplorer's query builder with node.
+nodejs = "*"
+
+[feature.r.dependencies]
+# check-r needs R with neuprintr's dependency stack. Everything conda-forge
+# carries is here; the rest (nat dev version, drvid, neuprintr) comes from
+# GitHub via `pixi run setup-r`.
+r-base = "*"
+r-devtools = "*"
+r-remotes = "*"
+r-pkgload = "*"
+r-httr = "*"
+r-jsonlite = "*"
+r-nabor = "*"
+r-igraph = "*"
+r-pbapply = "*"
+r-memoise = "*"
+r-dplyr = "*"
+r-bit64 = "*"
+r-stringr = "*"
+r-tibble = "*"
+r-matrix = "*"
+r-checkmate = "*"
+r-magrittr = "*"
+r-glue = "*"
+r-rgl = "*"
+r-filehash = "*"
+r-digest = "*"
+r-plyr = "*"
+r-yaml = "*"
+r-rcpp = "*"
+r-progress = "*"
+r-codetools = "*"
+c-compiler = "*"
+cxx-compiler = "*"
+make = "*"
+pkg-config = "*"
+
+[environments]
+clients = { features = ["clients"], solve-group = "default" }
+r = { features = ["r"] }
+
+# ---- tasks: one per program, verb first, arguments pass through --------------
+
+# fleet/
+[tasks.fleet]
+cmd = "python fleet/fleet-status.py"
+description = "Whole swarm: which dataset is where, and does everything agree"
+
+# compare/
+[tasks.compare]
+cmd = "python compare/compare-datasets.py"
+description = "Two datasets or servers: equivalent? (compare-datasets.py)"
+
+[tasks.cypher-diff]
+cmd = "python compare/cypher-version-diff.py"
+description = "neuPrintExplorer's FindNeurons queries under CYPHER 5 vs CYPHER 25, same dataset"
+
+# live/
+[tasks.audit-indexes]
+cmd = "live/audit-inert-indexes-http.sh"
+description = "Indexes whose label no node carries, per dataset, over HTTPS"
+
+[tasks.audit-indexes-bolt]
+cmd = "live/audit-inert-indexes.sh"
+description = "Indexes whose label no node carries, over Bolt; needs cypher-shell"
+
+[tasks.demo-inert-index]
+cmd = "live/demo-inert-index.sh"
+description = "What an index on a label nothing carries costs, in a throwaway container"
+
+# client/
+[tasks.check-explorer]
+cmd = "python client/check-rollout.py"
+description = "neuPrintExplorer's queries against a server (check-rollout.py)"
+
+[tasks.refresh-queries]
+cmd = "client/refresh-queries.sh"
+description = "Re-extract FindNeurons queries from a neuPrintExplorer checkout into client/queries"
+
+[feature.clients.tasks.check-python]
+cmd = "python client/check-neuprint-python.py"
+description = "neuprint-python's real NeuronCriteria against a server"
+
+[feature.clients.tasks.extract-queries]
+cmd = "findneurons/extract-queries.sh"
+description = "Extract FindNeurons queries from a neuPrintExplorer checkout into a directory"
+
+[feature.r.tasks.check-r]
+cmd = "Rscript client/check-neuprintr.R"
+description = "neuprintr's real functions against a server (check-neuprintr.R)"
+
+[feature.r.tasks.setup-r]
+cmd = """
+Rscript -e 'install.packages(c("nat.utils", "readobj"), repos = "https://cloud.r-project.org")' \
+&& Rscript -e 'remotes::install_github(c("natverse/nat", "natverse/drvid", "natverse/neuprintr"), upgrade = "never")'
+"""
+description = "One-time: install nat, drvid and neuprintr from GitHub into the r env"
+
+# regression/
+[tasks.verify-cached]
+cmd = "python regression/verify-cached-fix.py"
+description = "neuPrintHTTP cached.go fixes: old vs new Cypher on every Neo4j generation"
+
+[tasks.verify-isnull]
+cmd = "python regression/verify-isnull-compat.py"
+description = "IS NULL forms vs the exists() they replace, on every Neo4j generation"
+
+[tasks.compare-fastquery]
+cmd = "regression/compare-fastquery-forms.sh"
+description = "neuPrintExplorer's original vs fixed buildFastQuery, on a 4.4 server"
+
+# findneurons/
+[tasks.index-coverage]
+cmd = "findneurons/index-coverage.sh"
+description = "Does each dataset's FindNeurons fulltext index cover all eleven properties"
+
+[tasks.served-vs-complete]
+cmd = "findneurons/served-vs-complete.sh"
+description = "Per dataset, rows the client's query loses against buildSlowQuery (LOST)"
+
+[tasks.term-loss]
+cmd = "findneurons/term-loss.sh"
+description = "How many results the fast query loses vs the slow one, term by term"
+
+[tasks.find-demo-case]
+cmd = "findneurons/find-demo-case.sh"
+description = "A neuron findable only through a property the fulltext index misses"
+
+[tasks.gen-index-fix]
+cmd = "findneurons/gen-index-fix.sh"
+description = "Print the Cypher that rebuilds a dataset's FindNeurons index; runs nothing"
+
+# ---- umbrellas ---------------------------------------------------------------
+
+[tasks.rollout]
+description = "After a neuPrintHTTP deploy: check-explorer, verify-cached, verify-isnull on one server"
+args = [{ arg = "server" }]
+depends-on = [
+  { task = "check-explorer", args = ["{{ server }}"] },
+  { task = "verify-cached", args = ["{{ server }}"] },
+  { task = "verify-isnull", args = ["{{ server }}"] },
+]
+
+[tasks.clients]
+description = "Both client checks on one server; datasets as one quoted list, e.g. 'hemibrain:v1.2.1 wasp3:v0.0'"
+args = [{ arg = "server" }, { arg = "datasets" }]
+depends-on = [
+  { task = "check-python", environment = "clients", args = ["{{ server }}", "{{ datasets }}"] },
+  { task = "check-r", environment = "r", args = ["{{ server }}", "{{ datasets }}"] },
+]
