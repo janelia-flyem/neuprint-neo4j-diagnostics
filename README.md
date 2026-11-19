@@ -48,6 +48,84 @@ to the tools underneath. Like `&&`, an umbrella stops at the first check that
 fails, so a FAILED result names the first failing tool, not necessarily the
 only one.
 
+### Cookbook
+
+By the question you are asking. Every example is a real command against this
+fleet; set `NEUPRINT_JWT` once in the shell first.
+
+**Did the deploy work?**
+
+```bash
+pixi run rollout neuprint-pre              # after a neuPrintHTTP deploy: Explorer queries + both regression checks
+pixi run rollout neuprint-fish2            # same, any server; datasets are discovered
+pixi run check-explorer neuprint-pre       # just the Explorer check, default search terms
+pixi run check-explorer neuprint-fish2 "(Bc1)" SNpp         # your own terms, for a dataset the defaults miss
+pixi run verify-cached neuprint-pre hemibrain wasp3:v0.8   # cached.go fixes on named datasets only
+pixi run verify-isnull neuprint-cns        # IS NULL vs exists() on everything cns serves
+pixi run refresh-queries ~/path/to/neuPrintExplorer v1.72.3   # before a new Explorer release: test what it will send
+```
+
+**Where is everything, and does it agree?**
+
+```bash
+pixi run fleet                             # swarm, configs, endpoints, :Meta; writes results/*.txt and *.csv
+pixi run fleet --no-meta                   # 15 seconds, no container anywhere; enough for "is it Up and referenced"
+pixi run fleet --notes-from results/fleet-<stamp>.csv   # carry the notes column forward
+pixi run fleet --baseline fleet/baseline.txt            # once you have written one for the intended differences
+```
+
+**Are these two stores the same?**
+
+```bash
+pixi run compare neuprint-pre wasp3:v0.8 wasp3:v0.0        # two datasets on one server
+pixi run compare neuprint-pre:yakuba neuprint-test         # the same dataset name on two servers
+pixi run compare neuprint-pre:yakuba neuprint-test --no-timing   # skip the slow timing pass
+pixi run compare /path/to/snapshot/neo4j neuprint-pre:wasp3:v1.0 # a built snapshot against what is served
+pixi run compare neuprint-pre wasp3:v0.8 wasp3:v0.0 --baseline compare/baseline-wasp3.txt   # accept known differences
+pixi run cypher-diff neuprint-pre wasp3:v0.0               # CYPHER 5 vs CYPHER 25 on a CalVer store
+pixi run cypher-diff neuprint-yakuba yakuba-vnc:v0.0 DNa02 SNpp   # terms that exist in that dataset
+```
+
+**Is this store healthy?**
+
+```bash
+pixi run audit-indexes https://neuprint-fish2.janelia.org fish2     # inert indexes, one dataset over HTTPS
+pixi run audit-indexes https://neuprint.janelia.org                 # every dataset the token can see
+CYPHER_SHELL="ssh HOST docker exec -i CONTAINER cypher-shell" pixi run audit-indexes-bolt   # over Bolt, through a wrapper
+pixi run demo-inert-index                  # two-minute local reproduction of the fish2_:Soma defect
+```
+
+**Do the clients still work?**
+
+```bash
+pixi install -e clients                    # once
+pixi run check-python neuprint-pre         # the released neuprint-python, every dataset served
+PYTHONPATH=~/path/to/neuprint-python pixi run check-python neuprint-pre vnc wasp3:v0.8   # a branch instead
+pixi install -e r && pixi run setup-r      # once, 1.7 GB
+pixi run check-r neuprint hemibrain:v1.2.1 hemibrain:v1.2.3 neuprint-pre/wasp3:v0.0   # one dataset per generation
+pixi run check-r neuprint-pre wasp3:v0.0 --neuprintr-path ~/path/to/neuprintr        # a branch instead
+pixi run clients neuprint-pre "wasp3:v0.0 hemibrain"      # both checks; stops at the first FAIL
+```
+
+**Why is neuron search missing results?**
+
+```bash
+pixi run extract-queries ~/path/to/neuPrintExplorer origin/master findneurons/queries   # whose fast query is measured
+pixi run index-coverage https://neuprint.janelia.org          # which datasets index all eleven properties
+pixi run served-vs-complete https://neuprint.janelia.org a    # rows users get vs the complete set, per dataset
+pixi run term-loss https://neuprint.janelia.org banc:v888 lc,a,dn   # loss per term on one dataset
+pixi run find-demo-case https://neuprint.janelia.org banc:v888      # a neuron the UI cannot find
+pixi run gen-index-fix https://neuprint.janelia.org banc:v888       # prints the DDL; runs nothing
+LIST_ONLY=1 pixi run compare-fastquery     # plan and version survey across the 4.4 servers
+TERMS=lc pixi run compare-fastquery https://neuprint-cns.janelia.org   # one server, one term, quicker
+```
+
+Three habits apply everywhere. `--color always | less -R` keeps the colors
+when paging a Python tool, and `COLOR=always` does the same for a shell
+script. Every tool exits 0 when clean, 1 on a finding and 2 when it could not
+run. Nothing here writes to a database; the one thing any of them creates is
+the fleet tool's single container on the probe node, never on the manager.
+
 ## Where to look
 
 The directories follow the order you would actually use them in, from a freshly
