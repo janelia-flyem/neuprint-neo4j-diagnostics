@@ -84,6 +84,8 @@ pixi run compare /path/to/snapshot/neo4j neuprint-pre:wasp3:v1.0 # a built snaps
 pixi run compare neuprint-pre wasp3:v0.8 wasp3:v0.0 --baseline compare/baseline-wasp3.txt   # accept known differences
 pixi run cypher-diff neuprint-pre wasp3:v0.0               # CYPHER 5 vs CYPHER 25 on a CalVer store
 pixi run cypher-diff neuprint-yakuba yakuba-vnc:v0.0 DNa02 SNpp   # terms that exist in that dataset
+pixi run spatial neuprint-fish2 fish2 fish2:v0.0           # synapses in a sphere: same? how fast? index used?
+pixi run spatial neuprint-fish2 fish2 fish2:v0.0 --radius 1000 --reps 5   # bigger sphere, steadier medians
 ```
 
 **Is this store healthy?**
@@ -345,6 +347,44 @@ The question only exists from Neo4j 5 on: pointed at a 4.4 dataset it says
 divergences. The default terms are from hemibrain and the optic lobe; a term
 that matches no row under either version is reported as "not exercised", not
 as agreement, and a run where every term comes up empty gets no verdict.
+
+### `spatial-check.py` — are spatial queries indexed, fast, and the same?
+
+The ingest creates a POINT index `<ds>ElementLocation` on
+`<ds>_Element(location)`, and neuPrintExplorer's spatial plugin asks for the
+elements within a distance of a point. Neo4j 4.4 can create that index but
+cannot use it in a query (its manual calls POINT a "future index", for
+migration only), so on 4.4 every spatial query is a scan of the whole Element
+label. From Neo4j 5 on the index serves `point.distance()`. This is the one
+place a CalVer store should be dramatically faster, and the spelling changed
+too: `distance()` on 3.5 and 4.4, `point.distance()` on 5+.
+
+```bash
+./compare/spatial-check.py neuprint-fish2 fish2 fish2:v0.0
+./compare/spatial-check.py neuprint-fish2 fish2 fish2:v0.0 --point 56549 32907 10140 --radius 500
+pixi run spatial neuprint-fish2 fish2 fish2:v0.0
+```
+
+Per dataset it picks the distance function for the server's version, lists
+the indexes on `location` with their `readCount` before and after (5+ reports
+it; 4.4 does not), and runs three queries with the median of `--reps`: the
+element count within `--radius` of `--point`, the synapses in that sphere
+with type and confidence, and a control that asks the same question with an
+`abs()` bounding box no index can serve. Then it compares the synapse lists.
+Index use is a measured fact: `readCount` rose, or it did not. Neo4j flushes
+those statistics a few seconds behind the queries, so the tool waits up to
+`--settle` seconds for the counter to move and falls back to the timing gap
+against the control, with a warning, if it never does. Radius and
+point are in the dataset's coordinate units (voxels; `Meta.voxelSize` is
+printed), and with no `--point` a synapse from the first dataset is the
+center, so the sphere has data in it. A first run slower than `--slow`
+seconds is not repeated, because the 4.4 scan takes a minute on a
+50-million-element store.
+
+On fish2 the day it was deployed: the same 283 synapses on both, 55 to 66 s
+on 4.4.16 against 0.03 s on 2026.08.1 with `readCount` up by 6, and the
+unindexable control at 35 s on both, which is what proves the index rather
+than the hardware made the difference.
 
 ## `client/` — the two clients, against a real server
 
