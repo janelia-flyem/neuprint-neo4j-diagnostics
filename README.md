@@ -542,6 +542,7 @@ export NEUPRINT_JWT=<your token>
 ./fleet/fleet-status.py                                    # full run
 ./fleet/fleet-status.py --no-meta                          # skip the cypher-shell pass
 ./fleet/fleet-status.py --no-endpoints                     # skip the https probes (no token needed)
+./fleet/fleet-status.py --no-dvid                          # skip asking DVID whether each uuid is locked
 ./fleet/fleet-status.py --notes-from previous-map.csv      # keep the hand-written notes
 ./fleet/fleet-status.py --baseline fleet/baseline.txt      # accept known, intended differences
 ./fleet/fleet-status.py --no-report                        # terminal only, nothing under results/
@@ -558,7 +559,6 @@ swarm: nothing is scaled, started, stopped or written on any host. The only
 thing it creates is one short-lived `docker run --rm` container on the probe
 node per run, and it checks that node first. `--no-meta` skips the container
 entirely and finishes in about 15 seconds. The endpoint probes run in parallel,
-./fleet/fleet-status.py --no-dvid                          # skip asking DVID whether each uuid is locked
 one thread per instance, so an unreachable endpoint costs at most one 30 s
 timeout for the whole run, not one per endpoint.
 
