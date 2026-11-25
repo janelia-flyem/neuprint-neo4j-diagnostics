@@ -46,6 +46,8 @@ grepped for the fixes:
 | `SHOW INDEXES` | present | the Neo4j 5 capability probe (#383) |
 | `db.indexes()` | absent | the call Neo4j removed in 5.0 is gone (#383) |
 | `[^a-z0-9_]+` | present | `buildLuceneQuery`'s tokenizer (#386) |
+| `exists(s.` | absent | Synapses for connection no longer filters ROIs with `exists()`, which Neo4j 5 removed (#390) |
+| `point.distance` | present | the spatial plugin picks `point.distance()` from the server's version (#391) |
 
 This part exists because everything else here probes the **server**, and the
 server answers identically whether the new client is live or not. Without it a
