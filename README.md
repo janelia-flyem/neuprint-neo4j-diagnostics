@@ -86,6 +86,7 @@ pixi run cypher-diff neuprint-pre wasp3:v0.0               # CYPHER 5 vs CYPHER 
 pixi run cypher-diff neuprint-yakuba yakuba-vnc:v0.0 DNa02 SNpp   # terms that exist in that dataset
 pixi run spatial neuprint-fish2 fish2 fish2:v0.0           # synapses in a sphere: same? how fast? index used?
 pixi run spatial neuprint-fish2 fish2 fish2:v0.0 --radius 1000 --reps 5   # bigger sphere, steadier medians
+pixi run spatial neuprint-fish2 fish2 fish2:v0.0 --query @near-poi.cypher  # your own Cypher on both, same checks
 ```
 
 **Is this store healthy?**
@@ -362,6 +363,7 @@ too: `distance()` on 3.5 and 4.4, `point.distance()` on 5+.
 ```bash
 ./compare/spatial-check.py neuprint-fish2 fish2 fish2:v0.0
 ./compare/spatial-check.py neuprint-fish2 fish2 fish2:v0.0 --point 56549 32907 10140 --radius 500
+./compare/spatial-check.py neuprint-fish2 fish2 fish2:v0.0 --query @near-poi.cypher
 pixi run spatial neuprint-fish2 fish2 fish2:v0.0
 ```
 
@@ -385,6 +387,20 @@ On fish2 the day it was deployed: the same 283 synapses on both, 55 to 66 s
 on 4.4.16 against 0.03 s on 2026.08.1 with `readCount` up by 6, and the
 unindexable control at 35 s on both, which is what proves the index rather
 than the hardware made the difference.
+
+`--query` runs your own Cypher on both datasets instead of the built-in
+three: a string, `@FILE`, or `-` for stdin, written for the neuPrint API with
+plain labels (`:Neuron`, `:Synapse:Element`; the server prefixes them per
+dataset). Write the distance function either way; the tool respells it per
+store, `point.distance()` for 5+ and `distance()` for 3.5 and 4.4, so one
+file serves both sides. Rows are compared as values, nodes as their property
+maps, so `RETURN n, s` works; the table says identical rows, or how many
+exist only on each side, and notes when only the order differs. The index
+check applies when the query has a distance predicate on `location`; there
+is no control query in this mode. A query that joins from `:Neuron` through
+`:SynapseSet` to the synapses near a point returned 47 rows in 0.04 s on the
+CalVer fish2 and did not finish inside neuPrintHTTP's 180 s gateway limit on
+the 4.4 one, which is the practical form of "4.4 cannot use the index".
 
 ## `client/` — the two clients, against a real server
 
@@ -526,6 +542,7 @@ export NEUPRINT_JWT=<your token>
 ./fleet/fleet-status.py                                    # full run
 ./fleet/fleet-status.py --no-meta                          # skip the cypher-shell pass
 ./fleet/fleet-status.py --no-endpoints                     # skip the https probes (no token needed)
+./fleet/fleet-status.py --no-dvid                          # skip asking DVID whether each uuid is locked
 ./fleet/fleet-status.py --notes-from previous-map.csv      # keep the hand-written notes
 ./fleet/fleet-status.py --baseline fleet/baseline.txt      # accept known, intended differences
 ./fleet/fleet-status.py --no-report                        # terminal only, nothing under results/
@@ -557,7 +574,7 @@ fails, the Meta pass is reported with one `probe / <node>` warning, the
 header says how many stores were read, and every store is marked "not read"
 rather than reported as a fault of the store.
 
-Four sources, each collected independently so one failing does not blank the
+Five sources, each collected independently so one failing does not blank the
 others:
 
 | source | from | gives |
@@ -565,7 +582,8 @@ others:
 | **swarm** | `docker service ls / inspect / ps`, `docker node ls`, `docker inspect` of the running tasks, all on the manager | replicas (Up, Down 0/0, Not deployed), image tag = Neo4j version, `host.role` placement constraint, the node(s) the task is actually on and when it started, the `/data` volume, heap and page cache settings, the swarm memory limit |
 | **configs** | `/opt/conf/<instance>/conf/config.json`, read over ssh **from the node each neuprinthttp runs on** | main store (**M**) and every `mainstore-alternatives` entry (**A**), each with its `database` key if any; credentials held in memory for the Meta pass and never written |
 | **endpoints** | `https://neuprint-<x>.janelia.org/api/{version,dbmeta/database,dbmeta/datasets}` | what each instance serves, from outside |
-| **meta** | `MATCH (m:Meta) RETURN m.dataset, m.tag, m.uuid, m.hideDataSet, m.totalPreCount, m.totalPostCount` (as one pipe-joined string), via `cypher-shell` in one throwaway container on the probe node, over the swarm overlay network | `dataset:tag` per running store — the only way to tell `wasp3:v0.8` from `wasp3:v0.0`, whose uuid and lastDatabaseEdit are identical — plus hidden, uuid and synapse counts |
+| **meta** | `MATCH (m:Meta) RETURN m.dataset, m.tag, m.uuid, m.hideDataSet, m.totalPreCount, m.totalPostCount, m.latestMutationId, m.lastDatabaseEdit` (as one pipe-joined string), via `cypher-shell` in one throwaway container on the probe node, over the swarm overlay network | `dataset:tag` per running store — the only way to tell `wasp3:v0.8` from `wasp3:v0.0`, whose uuid and lastDatabaseEdit are identical — plus hidden, uuid, synapse counts, the newest DVID mutation the build saw and when |
+| **dvid** | `GET /api/repo/<uuid>/info` on the DVID server each config names as the skeleton source for that `dataset:tag` (`datatypes.skeletons[].engine-config.server`), one fetch per repo, no token | whether the node each store was built from is **locked**, how many mutations the repo has seen since, and which node the skeletons are actually fetched from |
 
 Why configs come from the running node and not the manager: every host carries
 copies of every config directory, and some are stale. The first run found the
@@ -632,14 +650,30 @@ but a one-row Meta query does not finish in two minutes, so whatever it
 holds is not served; a dataset:tag is held by two running services; a
 placement constraint names one node and the task runs on another; an endpoint
 serves a dataset no store behind it holds, or fails to serve one that a store
-does hold. `WARN` is context: an endpoint unreachable from here, a config
+does hold; a **tagged** dataset was built from a DVID node that is **not
+locked**, so the release's tag names data that can still change under it.
+`WARN` is context: an endpoint unreachable from here, a config
 directory with no service, a config.json that could not be read (which also
 suspends the "unreferenced" check, since a store that config might name cannot
 be called unreferenced), stale config copies, a CalVer store named without a
 `database` key, a probe node judged unsafe, a probe container that Docker
 could not start or that did not finish in time, an Up store with no VIP on the
 overlay (so it could not be probed), a Meta read that failed for a reason
-other than bolt being down.
+other than bolt being down, a DVID server that could not be asked, two
+stores that share a uuid but saw different mutation ids, and skeletons
+fetched from a DVID node upstream of the store's or outside its lineage.
+
+**Provenance.** The report's provenance section lists, per running store,
+the DVID node it was built from and that node's state in its repo. Two
+lessons paid for this: a release tag and the nightly of the same dataset
+once shared a uuid, which looked like "same data" until the mutation ids
+showed the nightly had captured the unlocked head twelve hours earlier; and
+a `v0.0` was served for two days from a build off a different node than
+the one its skeletons were configured for. An untagged (nightly) store on
+an unlocked node is the normal case and is only shown, not reported; a
+tagged store on one is a `DIFF`. Skeletons fetched from a node *downstream*
+of the store's are fine (regenerated later on the same lineage, body ids
+unchanged) and are not reported; upstream or off-lineage nodes are.
 
 The bolt check earned its place on the first full run: three 3.5 services
 (`neo4j-fib19`, `neo4j-hemibrain-v1_0_1`, `neo4j-hemibrain-v1_1_0`) reported
@@ -662,7 +696,10 @@ Both files are gitignored: they name internal hosts.
 | `since` | the running task's `Status.Timestamp` | when the container last (re)started. `neo4j-fib19` had been Up for weeks while dead on bolt; this is how long. |
 | `serves` | `Meta.dataset:tag` | what the store holds. Names lie: `neo4j-wasp` holds `wasp3:v0.8`, `neo4j-wasp-calver` holds `wasp3:v0.0`. |
 | `served by` | each endpoint's `/api/dbmeta/datasets` | the public hosts that actually expose a dataset:tag this store holds. M/A says configured, `serves` says held, this says reachable. |
-| `uuid` | `Meta.uuid` | which stores were built from the same segmentation. A uuid that is a mutable DVID head does not prove the same data (yakuba). |
+| `uuid` | `Meta.uuid` | which DVID node the store was built from. On its own it does not prove the same data: see the next three columns. |
+| `dvid node` | `GET /api/repo/<uuid>/info` on the config's skeleton server | `locked`, or `UNLOCKED (+N since)` with the repo mutations since the build; `not checked: <why>` when the DVID server could not be asked or the uuid is not a DVID node (bucket-backed datasets); blank when no config names a DVID server for the dataset:tag. |
+| `mutation id` | `Meta.latestMutationId` | the newest segmentation mutation the build saw. Two stores with the same uuid and different mutation ids were built from a moving head at different times. |
+| `captured` | the first half of `Meta.lastDatabaseEdit` | when the build read DVID, to the second. The second half of that property is rewritten by neuprinthttp while the store runs, so it is not used. |
 | `pre / post` | `Meta.totalPreCount / totalPostCount` | size sanity: two stores claiming the same dataset:tag should agree. |
 | `data dir` | the mount at `/data` | the named volume (or host path) the store lives in; needed before moving anything off a host. |
 | `heap`, `page cache`, `memory limit` | `NEO4J_*_memory_heap_max__size`, `NEO4J_*_memory_pagecache_size`, the swarm resource limit | configured, not measured: what the store may use, for capacity planning when consolidating hosts. Three columns so a sheet can sum them. Only the memory keys leave the host: the same Env block can carry `NEO4J_AUTH`. |

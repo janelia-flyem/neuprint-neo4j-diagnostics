@@ -9,6 +9,7 @@ each running neo4j holds. Then the places where those disagree.
 
     ./fleet-status.py                           # full run, report + CSV
     ./fleet-status.py --no-meta                 # skip the cypher-shell pass
+    ./fleet-status.py --no-dvid                 # skip asking DVID about each uuid
     ./fleet-status.py --notes-from old-map.csv  # carry the Notes column over
 
 Why this exists
@@ -33,12 +34,18 @@ Where the facts come from, and how far each one is trusted
              spreadsheet's M; each mainstore-alternatives entry is an A.
   endpoints  https://neuprint-<x>.janelia.org/api/{version,dbmeta/database,
              dbmeta/datasets}. What the instance serves, from outside.
-  meta       MATCH (m:Meta) RETURN m.dataset, m.tag, m.uuid on each running
+  meta       MATCH (m:Meta) RETURN m.dataset, m.tag, m.uuid,
+             m.latestMutationId, m.lastDatabaseEdit, ... on each running
              neo4j, via cypher-shell in a throwaway container on the swarm
              overlay network, so it works for services on nodes where this
              account has no docker access. 3.5 servers have auth enabled;
              their credentials are taken from the config.json that points at
              them, held in memory, and never written anywhere.
+  dvid       GET /api/repo/<uuid>/info on the DVID server each config names
+             as the skeleton source for that dataset:tag. Says whether the
+             node a store was built from is locked, how many mutations the
+             repo has seen since, and which node the skeletons come from.
+             No DVID token is used; repo info is readable on the site network.
 
 Each source is collected independently. When one cannot be read the report
 says so and the others still run; a verdict that needs a missing source is
@@ -53,12 +60,18 @@ What the verdicts mean
         a dataset:tag is held by two running services; a placement
         constraint names one node and the task runs on another; an endpoint
         lists a dataset that no store behind it can explain, or omits one
-        that a store behind it holds.
+        that a store behind it holds; a tagged dataset (a release) was built
+        from a DVID node that is not locked, so the tag names data that can
+        still change under it.
   WARN  worth knowing, not a fault: an endpoint unreachable from here, a
         config directory with no service (Not deployed), a stale config copy
         on a node that runs no neuprinthttp, a config.json that could not be
         read, a probe node judged unsafe, a store with no VIP, a Meta read
-        that failed for a reason other than bolt being down.
+        that failed for a reason other than bolt being down, a DVID server
+        that could not be asked, two stores that share a uuid but saw
+        different mutation ids (an unlocked node read at different times,
+        so "same uuid" proves nothing), skeletons fetched from a DVID node
+        upstream of the store's or outside its lineage.
 
 Outputs
 -------
@@ -66,8 +79,8 @@ Outputs
   results/fleet-<stamp>.csv   the spreadsheet: the original's columns
         (neo4j service, Status, neo4j version, node, one M/A column per
         neuprinthttp instance, notes) plus running on, since, serves,
-        served by, uuid, pre / post, data dir, heap, page cache and memory
-        limit.
+        served by, uuid, dvid node, mutation id, captured, pre / post,
+        data dir, heap, page cache and memory limit.
   Pass --notes-from <csv> to copy the notes column from a previous CSV by
   service name, so hand-written context survives a regeneration.
 
@@ -76,7 +89,8 @@ Requirements and safety
 Python 3 stdlib only. ssh as --user to --manager, to --probe-node and to
 each node that runs a neuprinthttp instance (defaults: the DEFAULT_*
 constants below); keys must already be in place (BatchMode, no
-prompts). NEUPRINT_JWT or NEUPRINT_TOKEN for the endpoints. Read-only against
+prompts). NEUPRINT_JWT or NEUPRINT_TOKEN for the endpoints; plain HTTP to the
+DVID servers the configs name, with no token. Read-only against
 the swarm: nothing is scaled, started, stopped or written on any host. The one
 thing it creates is one short-lived `docker run --rm` container on the probe
 node per run, and only after checking that node's kernel log and free memory
@@ -114,9 +128,11 @@ HTTP_PREFIX = f'{STACK}_neuprinthttp'
 SSH_TIMEOUT = 60
 CYPHER_TIMEOUT = 120
 HTTP_TIMEOUT = 30
+DVID_TIMEOUT = 30
 # One pipe-joined string per Meta node, so a field with a comma in it could
 # never break cypher-shell's comma-separated output.
-META_FIELDS = ['dataset', 'tag', 'uuid', 'hideDataSet', 'totalPreCount', 'totalPostCount']
+META_FIELDS = ['dataset', 'tag', 'uuid', 'hideDataSet', 'totalPreCount', 'totalPostCount',
+               'latestMutationId', 'lastDatabaseEdit']
 META_CYPHER = ('MATCH (m:Meta) RETURN '
                + " + '|' + ".join(f"coalesce(toString(m.{f}), '')" for f in META_FIELDS)
                + ' AS row')
@@ -398,6 +414,7 @@ def collect_configs(remote, swarm, manager, rep):
         inst['main'] = None
         inst['alternatives'] = []
         inst['credentials'] = {}       # service -> (user, password); never printed
+        inst['dvid'] = {}              # dataset:tag -> DVID server and node spec of its skeletons; tokens not kept
         if text is None:
             inst['error'] = 'unreadable'
             rep.warn(f'config / {inst["instance"]}: could not read {inst["path"]}')
@@ -418,6 +435,16 @@ def collect_configs(remote, swarm, manager, rep):
 
         inst['main'] = store(cfg)
         inst['alternatives'] = [store(a) for a in cfg.get('mainstore-alternatives', []) or []]
+        # Where neuprinthttp fetches skeletons (and meshes) for each dataset:tag:
+        # a DVID server and a node spec (a uuid, or <uuid-prefix>:<branch>).
+        # That is the only place the fleet records which DVID repo a dataset
+        # belongs to, so it is also where the uuid of a store can be checked.
+        for kind in ('skeletons', 'roimeshes'):
+            for entry in (cfg.get('datatypes') or {}).get(kind) or []:
+                ec = (entry or {}).get('engine-config') or {}
+                ds, server, node = ec.get('dataset'), ec.get('server'), ec.get('branch') or ec.get('uuid')
+                if ds and server and node and ds not in inst['dvid']:
+                    inst['dvid'][ds] = dict(server=str(server).rstrip('/'), node=str(node), kind=kind)
     return instances
 
 
@@ -435,23 +462,40 @@ def collect_stale_configs(remote, swarm, instances, rep):
             rep.warn(f'stale configs / {node}: runs no neuprinthttp, yet has {names}')
 
 
+def http_json(url, headers=None, timeout=HTTP_TIMEOUT):
+    """GET a JSON document -> (parsed, None) or (None, short error)."""
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read()), None
+    except urllib.error.HTTPError as e:
+        return None, f'HTTP {e.code}'
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, socket.gaierror):
+            return None, f'name resolution failed ({reason.strerror})'
+        return None, f'{type(reason).__name__}: {reason}'[:80]
+    except Exception as e:                                  # noqa: BLE001
+        return None, f'{type(e).__name__}: {e}'[:80]
+
+
+def captured_time(last_edit):
+    """Meta.lastDatabaseEdit -> when the build read DVID, to the second.
+
+    The property reads '<mutation time> / <property time> (segment property
+    update)'. The first half is the newest segmentation mutation the build
+    saw and never changes afterwards; the second half is rewritten by
+    neuprinthttp while the store runs, so it says nothing about the build."""
+    first = (last_edit or '').split(' / ')[0].strip()
+    m = re.match(r'(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d:\d\d)', first)
+    return f'{m.group(1)} {m.group(2)}' if m else first
+
+
 def collect_endpoints(instances, token, rep):
     """What each public neuprinthttp endpoint says about itself."""
     def get(host, path):
-        req = urllib.request.Request(f'https://{host}.janelia.org/{path}',
-                                     headers={'Authorization': f'Bearer {token}'})
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-                return json.loads(r.read()), None
-        except urllib.error.HTTPError as e:
-            return None, f'HTTP {e.code}'
-        except urllib.error.URLError as e:
-            reason = e.reason
-            if isinstance(reason, socket.gaierror):
-                return None, f'name resolution failed ({reason.strerror})'
-            return None, f'{type(reason).__name__}: {reason}'[:80]
-        except Exception as e:                                  # noqa: BLE001
-            return None, f'{type(e).__name__}: {e}'[:80]
+        return http_json(f'https://{host}.janelia.org/{path}',
+                         headers={'Authorization': f'Bearer {token}'})
 
     def probe(inst):
         host = 'neuprint' if inst['instance'] == 'public' else f'neuprint-{inst["instance"]}'
@@ -725,12 +769,152 @@ def collect_meta(remote, swarm, instances, probe_node, rep, image=PROBE_IMAGE):
                 metas.append(dict(dataset=ds, tag=tag, uuid=m['uuid'],
                                   hidden=m['hideDataSet'].lower() == 'true',
                                   pre=m['totalPreCount'], post=m['totalPostCount'],
+                                  mutation=m['latestMutationId'],
+                                  captured=captured_time(m['lastDatabaseEdit']),
+                                  dvid=None,
                                   served=f'{ds}:{tag}' if tag else ds))
         svc['meta'] = metas
         read += 1
         if not metas:
             rep.warn(f'meta / {short}: no :Meta node found')
     return read, skipped
+
+
+def dvid_host(server):
+    return re.sub(r'^https?://', '', server).split('/')[0]
+
+
+def is_dvid_spec(spec):
+    """A DVID node spec: a hex uuid (or prefix), or <prefix>:<branch>. Not
+    'v783b' or 'v888', which name a bucket version for a non-DVID source."""
+    spec = spec or ''
+    return bool(re.fullmatch(r'[0-9a-f]{4,32}', spec) or re.fullmatch(r'[0-9a-f]{4,32}:\S+', spec))
+
+
+def short_error(err):
+    e = err or ''
+    if 'Connection refused' in e:
+        return 'connection refused'
+    if 'timed out' in e.lower() or e.startswith('TimeoutError'):
+        return 'timed out'
+    return e
+
+
+def collect_dvid(swarm, instances, rep):
+    """Is the uuid each running store was built from a locked DVID node?
+
+    Looked up with GET /api/repo/<node>/info on the DVID server that the
+    instance configs name as the skeleton source for that dataset:tag; the
+    repo's DAG lists every node with its Locked flag, so one fetch answers
+    for every store built from that repo. The configs' own node specs are
+    resolved too (a uuid prefix, or <prefix>:<branch> meaning the head of
+    that branch), so the judge can tell when skeletons are fetched from a
+    different node than the store was built from. No DVID token is used:
+    repo info is readable on the site network. Returns (uuids checked,
+    servers asked)."""
+    source = {}                                    # dataset:tag -> DVID server
+    for inst in instances.values():
+        for ds, d in (inst.get('dvid') or {}).items():
+            source.setdefault(ds, d['server'])
+    wanted = {}                                    # server -> set of node specs
+    for svc in swarm['services'].values():
+        for m in svc.get('meta') or []:
+            m['dvid'] = None
+            server = source.get(m['served']) or source.get(m['dataset'])
+            if server and is_dvid_spec(m['uuid']):
+                wanted.setdefault(server, set()).add(m['uuid'])
+            elif server and m['uuid']:
+                m['dvid'] = dict(error='not a DVID uuid')
+    for inst in instances.values():
+        for d in (inst.get('dvid') or {}).values():
+            d['resolved'] = None
+            if is_dvid_spec(d['node']):
+                wanted.setdefault(d['server'], set()).add(d['node'])
+    if not wanted:
+        return 0, 0
+
+    def resolve_in(repo, spec):
+        """A node spec against one repo's DAG -> node dict or None."""
+        nodes = (repo.get('DAG') or {}).get('Nodes') or {}
+        if ':' in spec:
+            prefix, branch = spec.split(':', 1)
+            if not (repo.get('Root') or '').startswith(prefix) and not any(u.startswith(prefix) for u in nodes):
+                return None
+            want = '' if branch == 'master' else branch
+            members = [n for n in nodes.values() if (n.get('Branch') or '') == want]
+            leaves = [n for n in members if not n.get('Children')]
+            heads = sorted(leaves or members, key=lambda n: (n.get('Locked', True), -(n.get('VersionID') or 0)))
+            return heads[0] if heads else None
+        hits = [n for u, n in nodes.items() if u.startswith(spec)]
+        return hits[0] if len(hits) == 1 else None
+
+    def describe(repo, node):
+        # ancestors: this node and everything upstream of it in the DAG, so
+        # two nodes of one repo can be placed in the same lineage or not.
+        nodes = (repo.get('DAG') or {}).get('Nodes') or {}
+        by_vid = {str(n.get('VersionID')): u for u, n in nodes.items()}
+        ancestors, stack = set(), [node]
+        while stack:
+            n = stack.pop()
+            u = n.get('UUID', '')
+            if u in ancestors:
+                continue
+            ancestors.add(u)
+            stack.extend(nodes[by_vid[str(v)]] for v in n.get('Parents') or [] if str(v) in by_vid and by_vid[str(v)] in nodes)
+        return dict(uuid=node.get('UUID', ''), locked=node.get('Locked'),
+                    branch=(node.get('Branch') or 'master'), head=repo.get('MutationID'),
+                    root=repo.get('Root'), ancestors=ancestors,
+                    note=(node.get('Note') or '').strip())
+
+    def ask(server):
+        """Every spec wanted on one server -> {spec: result}; one fetch per repo."""
+        repos, out = [], {}
+        for spec in sorted(wanted[server]):
+            node, repo_hit = None, None
+            for repo in repos:
+                node = resolve_in(repo, spec)
+                if node:
+                    repo_hit = repo
+                    break
+            if node is None:
+                repo, err = http_json(f'{server}/api/repo/{spec}/info', timeout=DVID_TIMEOUT)
+                if err:
+                    err = short_error(err)
+                    out[spec] = dict(error=err)
+                    if err in ('connection refused', 'timed out') or err.startswith('name resolution'):
+                        for rest in wanted[server]:
+                            out.setdefault(rest, dict(error=err))
+                        break
+                    continue
+                repos.append(repo)
+                node, repo_hit = resolve_in(repo, spec), repo
+            out[spec] = describe(repo_hit, node) if node else dict(error='node not in the repo DAG')
+        return out
+
+    servers = sorted(wanted)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(servers)) as pool:
+        resolved = dict(zip(servers, pool.map(ask, servers)))
+
+    checked = 0
+    for svc in swarm['services'].values():
+        for m in svc.get('meta') or []:
+            server = source.get(m['served']) or source.get(m['dataset'])
+            if not (m['uuid'] and server) or m['dvid'] is not None:
+                continue
+            r = resolved.get(server, {}).get(m['uuid']) or dict(error='no answer')
+            if not r.get('error') and r.get('locked') is False and r.get('head') and str(m.get('mutation') or '').isdigit():
+                r['since'] = max(0, int(r['head']) - int(m['mutation']))
+            m['dvid'] = r
+            checked += not r.get('error')
+    for inst in instances.values():
+        for d in (inst.get('dvid') or {}).values():
+            d['resolved'] = resolved.get(d['server'], {}).get(d['node'])
+    for server in servers:
+        errs = {r['error'] for r in resolved[server].values() if r.get('error')}
+        for err in sorted(errs):
+            n = sum(1 for r in resolved[server].values() if r.get('error') == err)
+            rep.warn(f'dvid / {dvid_host(server)} / {err}: {n} node lookup(s) on this DVID server failed, so those uuids are not checked')
+    return checked, len(servers)
 
 
 def parse_probe_output(out):
@@ -812,6 +996,50 @@ def judge(swarm, instances, rep):
         if len(svcs) > 1:
             rep.diff(f'meta / {served} / duplicate: held by more than one running service: {", ".join(svcs)}')
 
+    # Provenance. A tagged dataset is a release: it should rest on a locked
+    # DVID node, or the tag names data that can still change under it. Two
+    # stores sharing a uuid should have seen the same mutations, or the uuid
+    # is a moving head and "same uuid" proves nothing. And the skeletons an
+    # instance serves for a dataset:tag should come from the node the store
+    # was built from, or body ids will not line up.
+    by_uuid = {}
+    for name, svc in neo4j.items():
+        for m in svc.get('meta') or []:
+            if m['uuid']:
+                by_uuid.setdefault(m['uuid'], []).append((m, short_name(name)))
+            dv = m.get('dvid') or {}
+            if m['tag'] and dv.get('locked') is False:
+                since = f', {dv["since"]} mutation(s) in the repo since' if dv.get('since') is not None else ''
+                rep.diff(f'uuid / {m["served"]} / unlocked: built from DVID node {m["uuid"][:8]}, '
+                         f'which is not locked (head of {dv["branch"]}{since}); a tag on a moving node')
+    for uuid, holders in sorted(by_uuid.items()):
+        muts = {m['mutation'] for m, _ in holders if m.get('mutation')}
+        if len(holders) > 1 and len(muts) > 1:
+            who = ', '.join(f'{m["served"]}@{svc} ({m["mutation"] or "?"})' for m, svc in holders)
+            rep.warn(f'uuid / {uuid[:8]} / drift: same DVID node, different mutation ids: {who}; '
+                     'it is an unlocked node read at different times')
+    # Skeletons are routinely fetched from a node downstream of the store's
+    # (regenerated later on the same lineage, body ids unchanged); that is
+    # fine. A node upstream of the store, or on another lineage altogether,
+    # is skeletons for a different segmentation.
+    for inst in instances.values():
+        for ds, d in sorted((inst.get('dvid') or {}).items()):
+            r = d.get('resolved') or {}
+            if not r or r.get('error'):
+                continue
+            for m, svc in [(m, s) for ms in by_uuid.values() for m, s in ms if m['served'] == ds]:
+                sr = m.get('dvid') or {}
+                if r['uuid'] == m['uuid'] or sr.get('error') or not sr.get('ancestors'):
+                    continue
+                if m['uuid'] in r['ancestors']:
+                    continue                                    # downstream of the store: fine
+                if r['uuid'] in sr['ancestors']:
+                    rel = "upstream of the store's node, so they predate the store"
+                else:
+                    rel = "not in the store's lineage"
+                rep.warn(f'dvid / {inst["instance"]} / {ds}: {d["kind"]} are fetched from DVID node '
+                         f'{r["uuid"][:8]} ({d["node"]}), {rel}; the store on {svc} was built from {m["uuid"][:8]}')
+
     for inst in instances.values():
         ep = inst.get('endpoint') or {}
         if not inst['deployed'] or not ep:
@@ -871,7 +1099,8 @@ def neo4j_rows(swarm, instances):
 def write_csv(path, swarm, instances, notes):
     cols = instance_columns(instances)
     header = ['neo4j service', 'Status', 'neo4j version', 'node', 'running on', 'since', 'serves', 'served by',
-              'uuid', 'pre / post', 'data dir', 'heap', 'page cache', 'memory limit'] + cols + ['notes']
+              'uuid', 'dvid node', 'mutation id', 'captured', 'pre / post', 'data dir',
+              'heap', 'page cache', 'memory limit'] + cols + ['notes']
     rows = []
     for svc in neo4j_rows(swarm, instances):
         name = svc['name']
@@ -888,7 +1117,8 @@ def write_csv(path, swarm, instances, notes):
         pre_post = ', '.join(f'{m["pre"]} / {m["post"]}' for m in metas if m['pre'] or m['post'])
         rows.append([short, display_status(svc), version_of(svc['image']), svc['constraint'],
                      svc['node'], svc.get('since', ''), join('served'), served_by(svc, instances),
-                     join('uuid'), pre_post, svc.get('data_dir', ''), *memory_of(svc)]
+                     join('uuid'), ', '.join(dvid_state(m)[0] for m in metas), join('mutation'), join('captured'),
+                     pre_post, svc.get('data_dir', ''), *memory_of(svc)]
                     + [marks[c] for c in cols] + [notes.get(short, '')])
     # The http row from the original sheet: service status per instance.
     http_row = ['http server (neuprinthttp service)'] + [''] * (len(header) - len(cols) - 2)
@@ -907,7 +1137,8 @@ def write_csv(path, swarm, instances, notes):
         w.writerow(['Key: M = main server in the config; A = entry in mainstore-alternatives.'])
         w.writerow(['Status is from docker service ls: Up = n/n replicas; Hidden = Up but Meta.hideDataSet is true, so neuPrintExplorer does not list it; Down (0/0) = scaled to zero; Not deployed = named by a config but not a swarm service.'])
         w.writerow(['neo4j version is the image tag from docker service ls (blank = not deployed). node is the host.role placement constraint; running on is the node the task is actually on; since is the date the running task started.'])
-        w.writerow(['serves, uuid and pre / post come from each running store\'s :Meta node (dataset:tag, uuid, totalPreCount / totalPostCount), read over the swarm network.'])
+        w.writerow(['serves, uuid, mutation id, captured and pre / post come from each running store\'s :Meta node (dataset:tag, uuid, latestMutationId, the mutation half of lastDatabaseEdit, totalPreCount / totalPostCount), read over the swarm network.'])
+        w.writerow(['dvid node is the Locked flag of the uuid in its DVID repo (GET /api/repo/<uuid>/info on the server the config names for its skeletons): locked, or UNLOCKED with the number of repo mutations since the build; blank when no config names a DVID server for the dataset:tag.'])
         w.writerow(['served by lists the public endpoints whose /api/dbmeta/datasets includes a dataset:tag this store holds.'])
         w.writerow(['data dir is the volume (or host path) mounted at /data. heap, page cache and memory limit are configured, not measured: the first two from the service environment (NEO4J_*_memory_heap_max__size, NEO4J_*_memory_pagecache_size), the last from the swarm resource limit.'])
 
@@ -924,6 +1155,43 @@ def load_notes(path):
             if name and note:
                 notes[name] = note
     return notes
+
+
+def dvid_state(m):
+    """One store's DVID lookup -> (plain text, kind) for the report and CSV."""
+    dv = m.get('dvid')
+    if dv is None:
+        return ('', 'none')
+    if dv.get('error'):
+        return (f'not checked: {dv["error"]}', 'unknown')
+    if dv.get('locked'):
+        return ('locked', 'locked')
+    since = f' (+{dv["since"]} since)' if dv.get('since') is not None else ''
+    return (f'UNLOCKED{since}', 'unlocked')
+
+
+def print_provenance(rep, swarm, instances):
+    """Which DVID node each running store was built from, and its state there."""
+    s = rep.s
+    rows = []
+    for svc in neo4j_rows(swarm, instances):
+        for m in svc.get('meta') or []:
+            rows.append((m['served'], svc['name'][len(STACK) + 1:], m))
+    if not rows:
+        return
+    rep.heading('--- provenance: the DVID node each store was built from ---')
+    w = max([22] + [len(r[0]) for r in rows])
+    ws = max([24] + [len(r[1]) for r in rows])
+    rep(s.dim(f'  {"dataset:tag":<{w}} {"store":<{ws}} {"uuid":<9} {"dvid node":<32} {"mutation id":<12} captured'))
+    for served, short, m in sorted(rows):
+        text, kind = dvid_state(m)
+        text = (text or 'no DVID source in any config')[:32]
+        cell = f'{text:<32}'
+        cell = (s.green(cell) if kind == 'locked'
+                else s.red(cell) if kind == 'unlocked' and m['tag']
+                else s.yellow(cell) if kind == 'unlocked'
+                else s.dim(cell))
+        rep(f'  {served:<{w}} {short:<{ws}} {(m["uuid"] or "")[:8]:<9} {cell} {m.get("mutation") or "":<12} {m.get("captured") or ""}')
 
 
 def print_report(rep, swarm, instances, manager, show_meta):
@@ -965,6 +1233,8 @@ def print_report(rep, swarm, instances, manager, show_meta):
             served = ''
         since = f'{svc["since"]:<11}' if svc.get('since') else s.dim(f'{"-":<11}')
         rep(f'  {short:<{w}} {st_s} {version_of(svc["image"]):<10} {svc["constraint"]:<8} {on} {since} {refs_s:<28} {served}')
+    if show_meta:
+        print_provenance(rep, swarm, instances)
 
     rep.heading('--- neuprinthttp instances ---')
     for c in cols:
@@ -1004,6 +1274,8 @@ def main(argv):
                         f'and the CalVer image cannot start on the probe node, whose Docker 20.10 seccomp profile blocks its Java)')
     p.add_argument('--user', default=DEFAULT_USER, metavar='NAME', help=f'ssh account on the hosts (default {DEFAULT_USER})')
     p.add_argument('--no-meta', action='store_true', help='skip reading :Meta from each running neo4j')
+    p.add_argument('--no-dvid', action='store_true',
+                   help='skip asking the DVID servers whether each store\'s uuid is a locked node')
     p.add_argument('--no-endpoints', action='store_true', help='skip the https://neuprint-*.janelia.org probes')
     p.add_argument('--notes-from', metavar='CSV', help='copy the notes column from a previous CSV by service name')
     p.add_argument('--no-report', action='store_true', help='do not write results/ files')
@@ -1048,6 +1320,9 @@ def run(args, remote, token, rep):
         if skipped:
             line += f' ({skipped} not attempted, see findings)'
         rep(line)
+        if not args.no_dvid:
+            checked, servers = collect_dvid(swarm, instances, rep)
+            rep(f'dvid:      {checked} store uuid(s) looked up on {servers} DVID server(s)')
 
     print_report(rep, swarm, instances, args.manager, show_meta=not args.no_meta)
     judge(swarm, instances, rep)
