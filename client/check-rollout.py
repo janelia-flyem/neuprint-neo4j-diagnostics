@@ -82,12 +82,17 @@ SEARCH_PROPS = [
 # minimum row count, so the same terms are meaningful on every dataset.
 DEFAULT_TERMS = ['a', 'R1-R6', 'KCab-s', 'SNta02,SNta09', "Tm5'", 'LC(L)']
 
-# Markers proving the deployed bundle carries each fix. Verified 2026-09-30 to
-# be present on neuprint-test (new client) and absent on neuprint-pre (old).
+# Markers proving the deployed bundle carries each fix. The first three were
+# verified 2026-09-30 to be present on neuprint-test (new client) and absent
+# on neuprint-pre (old). The last two were verified 2026-11-25 against the
+# 1.73.1 bundle every server served (old: `exists(s.` present, `point.distance`
+# absent) and the source of #390 and #391.
 BUNDLE_MARKERS = [
     ('SHOW INDEXES',   True,  'Neo4j 5 capability probe (#383)'),
     ('db.indexes()',   False, 'removed-in-5.0 call must be gone (#383)'),
     ('[^a-z0-9_]+',    True,  'buildLuceneQuery tokenizer (#386)'),
+    ('exists(s.',      False, 'Synapses for connection ROI filter must not use exists() (#390)'),
+    ('point.distance', True,  'spatial plugin picks point.distance() on Neo4j 5+ (#391)'),
 ]
 
 TIMEOUT = 300
