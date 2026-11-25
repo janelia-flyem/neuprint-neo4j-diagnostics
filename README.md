@@ -86,6 +86,7 @@ pixi run cypher-diff neuprint-pre wasp3:v0.0               # CYPHER 5 vs CYPHER 
 pixi run cypher-diff neuprint-yakuba yakuba-vnc:v0.0 DNa02 SNpp   # terms that exist in that dataset
 pixi run spatial neuprint-fish2 fish2 fish2:v0.0           # synapses in a sphere: same? how fast? index used?
 pixi run spatial neuprint-fish2 fish2 fish2:v0.0 --radius 1000 --reps 5   # bigger sphere, steadier medians
+pixi run spatial neuprint-fish2 fish2 fish2:v0.0 --query @near-poi.cypher  # your own Cypher on both, same checks
 ```
 
 **Is this store healthy?**
@@ -362,6 +363,7 @@ too: `distance()` on 3.5 and 4.4, `point.distance()` on 5+.
 ```bash
 ./compare/spatial-check.py neuprint-fish2 fish2 fish2:v0.0
 ./compare/spatial-check.py neuprint-fish2 fish2 fish2:v0.0 --point 56549 32907 10140 --radius 500
+./compare/spatial-check.py neuprint-fish2 fish2 fish2:v0.0 --query @near-poi.cypher
 pixi run spatial neuprint-fish2 fish2 fish2:v0.0
 ```
 
@@ -385,6 +387,20 @@ On fish2 the day it was deployed: the same 283 synapses on both, 55 to 66 s
 on 4.4.16 against 0.03 s on 2026.08.1 with `readCount` up by 6, and the
 unindexable control at 35 s on both, which is what proves the index rather
 than the hardware made the difference.
+
+`--query` runs your own Cypher on both datasets instead of the built-in
+three: a string, `@FILE`, or `-` for stdin, written for the neuPrint API with
+plain labels (`:Neuron`, `:Synapse:Element`; the server prefixes them per
+dataset). Write the distance function either way; the tool respells it per
+store, `point.distance()` for 5+ and `distance()` for 3.5 and 4.4, so one
+file serves both sides. Rows are compared as values, nodes as their property
+maps, so `RETURN n, s` works; the table says identical rows, or how many
+exist only on each side, and notes when only the order differs. The index
+check applies when the query has a distance predicate on `location`; there
+is no control query in this mode. A query that joins from `:Neuron` through
+`:SynapseSet` to the synapses near a point returned 47 rows in 0.04 s on the
+CalVer fish2 and did not finish inside neuPrintHTTP's 180 s gateway limit on
+the 4.4 one, which is the practical form of "4.4 cannot use the index".
 
 ## `client/` — the two clients, against a real server
 

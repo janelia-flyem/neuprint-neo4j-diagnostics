@@ -9,6 +9,7 @@ actually used?
     ./spatial-check.py neuprint-fish2 fish2 fish2:v0.0
     ./spatial-check.py neuprint-fish2 fish2 fish2:v0.0 --point 56549 32907 10140 --radius 500
     ./spatial-check.py neuprint-pre wasp3:v0.8 wasp3:v0.0 --reps 5
+    ./spatial-check.py neuprint-fish2 fish2 fish2:v0.0 --query @near-poi.cypher
 
 Why: the ingest creates a POINT index `<ds>ElementLocation` on
 `<ds>_Element(location)`, and the client's spatial plugin asks for elements
@@ -42,6 +43,14 @@ What it does, per dataset:
 Radius and point are in the dataset's coordinate units (voxels: see
 Meta.voxelSize, printed). With no --point, a synapse from dataset A is used,
 so the sphere is somewhere with data in it.
+
+--query runs your own Cypher instead of the built-in three: a string, @FILE,
+or - for stdin, written for the neuPrint API (plain labels such as :Neuron;
+the server prefixes them per dataset). Write the distance function either
+way; it is respelled per store, point.distance() for 5+ and distance() for
+3.5 and 4.4, so one query serves both sides. Rows are compared as values
+(nodes as their property maps) and the index check applies when the query
+has a distance predicate; there is no control query in this mode.
 
 A query that takes longer than --slow seconds on its first run is not
 repeated: on a 4.4 store the scan can take minutes, and neuPrintHTTP's
@@ -110,6 +119,13 @@ class Store:
         self.fn = 'distance' if major in ('3', '4') else 'point.distance'
         return None
 
+    def respell(self, q):
+        """The user's distance function in this store's spelling."""
+        import re
+        if self.fn == 'distance':
+            return q.replace('point.distance(', 'distance(')
+        return re.sub(r'(?<![\w.])distance\(', 'point.distance(', q)
+
     def location_indexes(self):
         """[(name, type, state, readCount or None)] for indexes on `location`."""
         rows, _, err = self.cypher(
@@ -170,6 +186,113 @@ def timed(st, q, reps, slow):
     return statistics.median(times), rows, None, len(times)
 
 
+def index_hits(st, before, settle):
+    """How much readCount rose on the location indexes since `before`.
+
+    Index usage statistics are flushed a few seconds behind the queries
+    (measured: ~5 s on 2026.08.1), so poll until the counter moves or
+    `settle` seconds pass. 0 when the server does not report readCount."""
+    if not before or not any(b[3] is not None for b in before):
+        return 0
+    t0, delta = time.time(), {}
+    while True:
+        after, err = st.location_indexes()
+        if after:
+            delta = {a[0]: (a[3] or 0) - (b[3] or 0) for a, b in zip(after, before)
+                     if a[3] is not None and b[3] is not None}
+            if sum(delta.values()) > 0 or time.time() - t0 > settle:
+                break
+        elif err:
+            break
+        time.sleep(2)
+    return sum(delta.values())
+
+
+def measure_query(st, query, args):
+    """Run the user's query on one store: timing, rows, and index use."""
+    f = dict(version=st.version, fn=st.fn, errors=[], res={})
+    q = st.respell(query)
+    f['query'] = q
+    before, err = st.location_indexes()
+    f['indexes'] = before or []
+    if err:
+        f['errors'].append(f'could not list indexes: {err[:100]}')
+    med, rows, qerr, n = timed(st, q, args.reps, args.slow)
+    if qerr:
+        f['errors'].append(f'query: {qerr}')
+        f['res']['query'] = None
+    else:
+        f['res']['query'] = (med, rows, n)
+    spatial = 'distance(' in q and 'location' in q
+    f['hits'] = index_hits(st, before, args.settle) if spatial and f['res']['query'] else 0
+    major = (st.version or '0').split('.')[0]
+    if not spatial:
+        f['used'], f['used_text'] = None, 'n/a: no distance predicate on location in the query'
+    elif major in ('3', '4'):
+        f['used'], f['used_text'] = None, f'cannot be, on {st.version}'
+    elif f['hits'] > 0:
+        f['used'], f['used_text'] = True, f'yes, readCount rose by {f["hits"]}'
+    elif f['res']['query']:
+        f['used'], f['used_text'] = False, f'NO: readCount unchanged after {args.settle:g} s'
+    else:
+        f['used'], f['used_text'] = None, 'not measured'
+    return f
+
+
+def canon(row):
+    """A row as a comparable string: nodes become their property maps, key order fixed."""
+    return json.dumps(row, sort_keys=True, separators=(',', ':'), default=str)
+
+
+IDENTITY_KEYS = ('bodyId', 'location', 'type')
+
+
+def ident(row):
+    """A row reduced to what identifies its nodes, so two builds of one dataset
+    can be matched row for row: a node map keeps only bodyId, or location and
+    type for a synapse; everything else (ROI flags, roiInfo, status, counts)
+    is build-specific and compared separately as a property difference."""
+    def one(v):
+        if isinstance(v, dict):
+            keep = {k: v[k] for k in IDENTITY_KEYS if k in v}
+            return keep if keep else v
+        return v
+    return json.dumps([one(v) for v in row], sort_keys=True, separators=(',', ':'), default=str)
+
+
+def property_diffs(rows_a, rows_b):
+    """For rows matched by identity, which node properties differ -> (rows differing, {prop: count})."""
+    by_a = {}
+    for r in rows_a:
+        by_a.setdefault(ident(r), []).append(r)
+    n, props = 0, {}
+    for rb in rows_b:
+        bucket = by_a.get(ident(rb))
+        if not bucket:
+            continue
+        ra = bucket.pop(0)
+        changed = False
+        for va, vb in zip(ra, rb):
+            if isinstance(va, dict) and isinstance(vb, dict):
+                for k in set(va) | set(vb):
+                    if va.get(k) != vb.get(k):
+                        props[k] = props.get(k, 0) + 1
+                        changed = True
+            elif va != vb:
+                props['(value)'] = props.get('(value)', 0) + 1
+                changed = True
+        n += changed
+    return n, props
+
+
+def read_query(spec):
+    if spec == '-':
+        return sys.stdin.read()
+    if spec.startswith('@'):
+        return Path(spec[1:]).read_text()
+    return spec
+
+
 def measure(st, point, args, s):
     """Run the three queries and the index bookkeeping for one store; return a dict of facts."""
     f = dict(version=st.version, fn=st.fn, errors=[])
@@ -187,24 +310,8 @@ def measure(st, point, args, s):
             res[name] = (med, rows, n)
     f['res'] = res
 
-    # Index usage statistics are flushed a few seconds behind the queries
-    # (measured: ~5 s on 2026.08.1), so poll until the counter moves.
     f['used'] = None            # True / False / None (not measurable)
-    f['hits'] = 0
-    if before and any(b[3] is not None for b in before):
-        t0 = time.time()
-        delta = {}
-        while True:
-            after, err = st.location_indexes()
-            if after:
-                delta = {a[0]: (a[3] or 0) - (b[3] or 0) for a, b in zip(after, before)
-                         if a[3] is not None and b[3] is not None}
-                if sum(delta.values()) > 0 or time.time() - t0 > args.settle:
-                    break
-            elif err:
-                break
-            time.sleep(2)
-        f['hits'] = sum(delta.values())
+    f['hits'] = index_hits(st, before, args.settle)
     c, k = res.get('control'), res.get('count')
     f['gain'] = (c[0] / max(k[0], 1e-9)) if c and k else None
     major = (st.version or '0').split('.')[0]
@@ -226,6 +333,106 @@ def measure(st, point, args, s):
     return f
 
 
+def run_query_mode(a, b, query, args, s):
+    from common.style import strip_ansi
+    query = query.strip()
+    if not query:
+        print('ERROR: --query is empty.', file=sys.stderr)
+        return 2
+    print(f'server:  {a.server}')
+    print(f'reps:    {args.reps} per query, median reported; a first run over {args.slow:g} s is not repeated')
+    print('query:   (distance function respelled per store)')
+    for line in query.splitlines():
+        print(f'    {line}')
+    print()
+    fa, fb = measure_query(a, query, args), measure_query(b, query, args)
+
+    def failed(f):
+        return s.red('gateway timeout (>180 s)' if any('504' in e for e in f['errors']) else 'failed')
+
+    def secs(f):
+        r = f['res'].get('query')
+        if not r:
+            return failed(f)
+        med, _, n = r
+        txt = f'{med:.2f} s' if med < 10 else f'{med:.1f} s'
+        return txt if n == args.reps else txt + s.dim(' (1 run)')
+
+    # Rows are matched by identity (bodyId; location and type), so that two
+    # builds of one dataset compare row for row; whether the matched rows
+    # also agree in every property is reported underneath as a note.
+    ra, rb = fa['res'].get('query'), fb['res'].get('query')
+    la = [ident(r) for r in ra[1]] if ra else None
+    lb = [ident(r) for r in rb[1]] if rb else None
+    from collections import Counter
+    ca, cb = (Counter(la) if la is not None else None), (Counter(lb) if lb is not None else None)
+    same = ca is not None and cb is not None and ca == cb
+    n_prop, props = (property_diffs(ra[1], rb[1]) if ra and rb else (0, {}))
+    exact = same and n_prop == 0
+    if ca is None or cb is None:
+        res_a = failed(fa) if ca is None else f'{len(la)} rows'
+        res_b = failed(fb) if cb is None else f'{len(lb)} rows'
+    elif same:
+        order = '' if la == lb else s.yellow(', order differs')
+        what = 'identical rows' if exact else 'same rows'
+        res_a = res_b = s.green(what) + f' ({len(la)}){order}'
+    else:
+        only_a, only_b = ca - cb, cb - ca
+        res_a = s.red(f'{len(la)} rows, {sum(only_a.values())} only here')
+        res_b = s.red(f'{len(lb)} rows, {sum(only_b.values())} only here')
+
+    def used(f):
+        t = f['used_text']
+        return s.green(t) if f['used'] else (s.red(t) if f['used'] is False else s.yellow(t))
+
+    def index_row(f):
+        if not f['indexes']:
+            return s.yellow('none on location')
+        return ', '.join(f'{n} {t} {st}' for n, t, st, _ in f['indexes'])
+
+    ha, hb = f'{a.dataset} ({a.version})', f'{b.dataset} ({b.version})'
+    rows = [
+        ('distance function', f'{a.fn}()', f'{b.fn}()'),
+        ('index on location', index_row(fa), index_row(fb)),
+        ('rows returned', res_a, res_b),
+        ('query time', secs(fa), secs(fb)),
+        ('POINT index used', used(fa), used(fb)),
+    ]
+    w0 = max(len(r[0]) for r in rows)
+    w1 = max([len(strip_ansi(ha))] + [len(strip_ansi(r[1])) for r in rows])
+    pad = lambda t, w: t + ' ' * (w - len(strip_ansi(t)))      # noqa: E731
+    print(f'  {"":<{w0}}  {s.cyan(pad(ha, w1))}  {s.cyan(hb)}')
+    for label, va, vb in rows:
+        print(f'  {label:<{w0}}  {pad(va, w1)}  {vb}')
+    print()
+
+    exit_code = 0
+    if ca is not None and cb is not None and not same:
+        exit_code = 1
+        for k in list((ca - cb).elements())[:3]:
+            print(f'  only in {a.dataset}: {k[:200]}')
+        for k in list((cb - ca).elements())[:3]:
+            print(f'  only in {b.dataset}: {k[:200]}')
+    if n_prop:
+        top = sorted(props.items(), key=lambda kv: -kv[1])
+        names = ', '.join(f'{k} ({v})' for k, v in top[:6]) + (f', and {len(top) - 6} more' if len(top) > 6 else '')
+        print(f'  {s.yellow("note")}: {n_prop} of the matched rows differ in node properties: {names}. '
+              'ROI flags and roiInfo are build-specific; the stores were not built from the same snapshot.')
+    for st, f in ((a, fa), (b, fb)):
+        for e in f['errors']:
+            print(f'  {s.red("error")} {st.dataset}: {e}')
+        if f['used'] is False:
+            exit_code = 1
+    if ca is None or cb is None:
+        exit_code = max(exit_code, 1)
+    if exit_code:
+        print(f'RESULT: {s.red("DIFFERENCES")} -- see above.')
+    else:
+        tail = '' if exact else ' (matched by identity; see the note on properties)'
+        print(f'RESULT: {s.green("OK")} -- same rows on both{tail}, and every store that can use its POINT index did.')
+    return exit_code
+
+
 def main(argv):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('server')
@@ -240,6 +447,9 @@ def main(argv):
                    help='a first run slower than this many seconds is not repeated (default 30)')
     p.add_argument('--settle', type=float, default=30.0,
                    help='seconds to wait for readCount to catch up with the queries (default 30)')
+    p.add_argument('--query', metavar='CYPHER|@FILE|-',
+                   help='run this Cypher on both datasets instead of the built-in queries '
+                        '(distance function respelled per store; --point/--radius/--limit unused)')
     add_color_argument(p)
     if len(argv) == 1:
         print(__doc__)
@@ -258,6 +468,8 @@ def main(argv):
         if err:
             print(f'ERROR: {st.dataset} did not answer: {err}', file=sys.stderr)
             return 2
+    if args.query:
+        return run_query_mode(a, b, read_query(args.query), args, s)
     point = args.point or a.sample_point()
     if not point:
         print('ERROR: no synapse found in dataset A to center on; pass --point.', file=sys.stderr)
